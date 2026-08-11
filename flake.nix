@@ -23,7 +23,7 @@
           installPhase = ''
             mkdir -p $out/bin
             mkdir -p build
-            odin build src/nix_workspace.odin -file -out:build/nws
+            odin build src/nix_workspace.odin -file -collection:nwscore=src -out:build/nws
             cp build/nws $out/bin/
           '';
         };
@@ -45,7 +45,7 @@
             };
 
             enterTest = ''
-              odin test tests
+              odin test tests -collection:nwscore=src
             '';
 
             enterShell = ''

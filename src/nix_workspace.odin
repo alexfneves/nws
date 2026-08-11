@@ -15,6 +15,7 @@ package main
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:sys/linux"
 import "nwscore:core"
@@ -49,6 +50,7 @@ Daemon_State :: struct {
 	clients:     [dynamic]Client,
 	config_path: string,
 	port:        int,
+	logging:     bool,
 }
 
 Add_Result :: enum {
@@ -131,19 +133,26 @@ config_path :: proc() -> string {
 	return strings.concatenate({home, "/.config/nws/config.json"}, context.allocator)
 }
 
-// normalize_path makes a path absolute (if it isn't) and strips trailing
-// slashes, so the daemon stores canonical absolute paths for dedup + watches.
+// normalize_path returns the lexically-cleaned absolute path for p, so that
+// equivalent inputs (redundant slashes, "."/".." segments, a trailing slash)
+// dedup consistently. Note: symlink resolution (realpath) is unavailable in
+// this Odin, so symlink aliases are not collapsed here.
 normalize_path :: proc(p: string) -> string {
-	t := p
-	for len(t) > 1 && t[len(t) - 1] == '/' {
-		t = t[:len(t) - 1]
+	abs_p, perr := filepath.abs(p, context.allocator)
+	if perr != nil {
+		// Fall back to the raw input if we cannot resolve the cwd.
+		cleaned, cerr := filepath.clean(p, context.allocator)
+		if cerr != nil {
+			return strings.clone(p, context.allocator)
+		}
+		return cleaned
 	}
-	if strings.has_prefix(t, "/") {
-		return strings.clone(t, context.allocator)
+	cleaned, cerr := filepath.clean(abs_p, context.allocator)
+	if cerr != nil {
+		return abs_p
 	}
-	cwd, _ := os.get_working_directory(context.allocator)
-	defer delete(cwd)
-	return strings.concatenate({cwd, "/", t}, context.allocator)
+	delete(abs_p)
+	return cleaned
 }
 
 // resolve_path returns the canonical path a client command should act on:
@@ -317,6 +326,7 @@ run_service :: proc() {
 	state := Daemon_State{}
 	state.config_path = cfg_path
 	state.port = cfg.port
+	state.logging = logging
 
 	// inotify
 	fd, errno := linux.inotify_init1({.NONBLOCK, .CLOEXEC})
@@ -431,11 +441,15 @@ service_clients :: proc(state: ^Daemon_State, logging: bool) {
 				n, rerr := net.recv_tcp(c.sock, buf[:])
 				if n > 0 {
 					append(&c.buf, ..buf[:n])
+					continue
 				}
-				if rerr != nil || n <= 0 {
-					c.closed = true
+				// n == 0 here: keep the client on Would_Block (more data may
+				// come on a later poll pass); close only on real EOF or error.
+				if rerr == .Would_Block {
 					break
 				}
+				c.closed = true // graceful EOF (0, nil) or a real error
+				break
 			}
 		}
 
@@ -550,7 +564,7 @@ add_workspace :: proc(state: ^Daemon_State, path: string) -> Add_Result {
 	}
 
 	append(&state.ws, Workspace{path = strings.clone(path, context.allocator), wd = wd})
-	log_line(should_log(), "added workspace %q (wd %d)", path, wd)
+	log_line(state.logging, "added workspace %q (wd %d)", path, wd)
 
 	// Materialise an already-present clone immediately, then persist.
 	sync_workspace(state, path)
@@ -562,7 +576,7 @@ remove_workspace :: proc(state: ^Daemon_State, path: string) -> bool {
 	for ws, i in state.ws {
 		if ws.path == path {
 			linux.inotify_rm_watch(state.inotify_fd, ws.wd)
-			log_line(should_log(), "removed workspace %q (wd %d)", ws.path, ws.wd)
+			log_line(state.logging, "removed workspace %q (wd %d)", ws.path, ws.wd)
 			delete(ws.path)
 			unordered_remove(&state.ws, i)
 			save_state_config(state)
@@ -713,10 +727,10 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 	defer delete(tmp)
 	if err := os.write_entire_file(tmp, new_text); err == nil {
 		os.rename(tmp, flake)
-		log_line(should_log(), "rewrote %s", flake)
+		log_line(state.logging, "rewrote %s", flake)
 	} else {
 		os.remove(tmp)
-		log_line(should_log(), "failed to write %s: %v", tmp, err)
+		log_line(state.logging, "failed to write %s: %v", tmp, err)
 	}
 }
 

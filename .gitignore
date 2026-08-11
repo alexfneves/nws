@@ -1,0 +1,22 @@
+# --- Nix / devenv / direnv ---
+.devenv/
+.direnv/
+result
+
+# --- Build / temporary artifacts ---
+build/
+*.tmp
+*.out
+
+# --- Odin build outputs ---
+*.o
+*.a
+*.so
+
+# --- Editor / OS ---
+*.swp
+*~
+.DS_Store
+
+# --- Logs ---
+*.log

@@ -16,15 +16,31 @@
     in
     {
       packages.${system} = rec {
+        systemdUnit = pkgs.runCommand "nws-systemd-unit" { } ''
+          mkdir -p $out/share/systemd/user
+          cat > $out/share/systemd/user/nws.service <<'EOF'
+          [Unit]
+          Description=Nix Workspace daemon
+          [Service]
+          Type=simple
+          ExecStart=%h/.nix-profile/bin/nws service
+          Restart=on-failure
+          [Install]
+          WantedBy=default.target
+          EOF
+        '';
+
         main = pkgs.stdenv.mkDerivation {
           name = "main";
           src = ./.;
           buildInputs = [ pkgs.odin ];
           installPhase = ''
             mkdir -p $out/bin
+            mkdir -p $out/share/systemd/user
             mkdir -p build
             odin build src/nix_workspace.odin -file -collection:nwscore=src -out:build/nws
             cp build/nws $out/bin/
+            cp ${systemdUnit}/share/systemd/user/nws.service $out/share/systemd/user/nws.service
           '';
         };
 
@@ -35,6 +51,10 @@
         inherit inputs pkgs;
         modules = [
           ({ pkgs, config, ... }: {
+            packages = [ self.packages.${system}.main ];
+
+            processes.nws.exec = "exec ${self.packages.${system}.main}/bin/nws service";
+
             languages.odin.enable = true;
 
             git-hooks.hooks.odin-fmt = {
@@ -50,7 +70,7 @@
 
             enterShell = ''
               echo "Development shell for nix-workspace (nws)"
-            '';  
+            '';
           })
         ];
       };

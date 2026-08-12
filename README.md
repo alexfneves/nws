@@ -87,6 +87,28 @@ nws list                         # see registered workspaces
 nws unregister ~/projects/mytree # stop watching it
 ```
 
+## Shell completion
+
+`nws` ships static tab-completion files for **bash**, **zsh**, and **fish**.
+They are installed automatically with `nix profile install .#main` and are
+also exposed by the devenv devShell, since both pull `main`'s `share/` tree
+(no runtime subcommand or extra setup needed):
+
+| shell | file | how it's picked up |
+|-------|------|--------------------|
+| bash  | `share/bash-completion/completions/nws` | needs the `bash-completion` package (present on NixOS and in this devenv) |
+| zsh   | `share/zsh/site-functions/_nws` | needs `autoload -Uz compinit && compinit` (standard on NixOS/home-manager) |
+| fish  | `share/fish/vendor_completions.d/nws.fish` | auto-loaded — nothing to enable |
+
+What completes:
+
+- `nws <TAB>` — the subcommands `service register unregister list help`.
+- `nws register <TAB>` — filesystem paths (always).
+- `nws unregister <TAB>` — the registered workspace canonical paths (from
+  `nws list`), but **only while the daemon is reachable**. If the daemon is
+  down it falls back to plain filesystem completion, so completion never
+  hangs or errors.
+
 ## Configuration
 
 The daemon reads `~/.config/nws/config.json` on startup. If the file is missing

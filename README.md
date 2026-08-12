@@ -90,14 +90,22 @@ nws unregister ~/projects/mytree # stop watching it
 ## Shell completion
 
 `nws` ships static tab-completion files for **bash**, **zsh**, and **fish**.
-They are installed automatically with `nix profile install .#main` and are
-also exposed by the devenv devShell, since both pull `main`'s `share/` tree
-(no runtime subcommand or extra setup needed):
+They are included in `main`'s `share/` tree, so you must install `nws` into
+your Nix profile for them to be active:
+
+```bash
+nix profile install .#main
+```
+
+This is **required** for completion to work — a bare `nix develop` exposes the
+files via `$XDG_DATA_DIRS`, but only *bash* scans that automatically; zsh and
+fish need the files in their own completion search paths, and the profile
+install places them there (`~/.nix-profile/share/...`).
 
 | shell | file | how it's picked up |
 |-------|------|--------------------|
 | bash  | `share/bash-completion/completions/nws` | needs the `bash-completion` package (present on NixOS and in this devenv) |
-| zsh   | `share/zsh/site-functions/_nws` | needs `autoload -Uz compinit && compinit` (standard on NixOS/home-manager) |
+| zsh   | `share/zsh/site-functions/_nws` | needs `autoload -Uz compinit && compinit` (standard on NixOS/home-manager). If it still doesn't complete in a `nix develop` shell, add the Nix completion dirs to `fpath` in your `~/.zshrc`: `fpath+=(${^XDG_DATA_DIRS}/share/zsh/site-functions(N))` before `compinit` |
 | fish  | `share/fish/vendor_completions.d/nws.fish` | auto-loaded — nothing to enable |
 
 What completes:

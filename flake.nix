@@ -16,6 +16,15 @@
     in
     {
       packages.${system} = rec {
+        completions = pkgs.runCommand "nws-completions" { } ''
+          mkdir -p $out/share/bash-completion/completions \
+                   $out/share/zsh/site-functions \
+                   $out/share/fish/vendor_completions.d
+          cp ${./completions}/bash/nws      $out/share/bash-completion/completions/nws
+          cp ${./completions}/zsh/_nws      $out/share/zsh/site-functions/_nws
+          cp ${./completions}/fish/nws.fish $out/share/fish/vendor_completions.d/nws.fish
+        '';
+
         systemdUnit = pkgs.runCommand "nws-systemd-unit" { } ''
           mkdir -p $out/share/systemd/user
           cat > $out/share/systemd/user/nws.service <<'EOF'
@@ -41,6 +50,8 @@
             odin build src/nix_workspace.odin -file -collection:nwscore=src -out:build/nws
             cp build/nws $out/bin/
             cp ${systemdUnit}/share/systemd/user/nws.service $out/share/systemd/user/nws.service
+            mkdir -p $out/share
+            cp -r ${completions}/share/* $out/share/
           '';
         };
 
@@ -51,7 +62,7 @@
         inherit inputs pkgs;
         modules = [
           ({ pkgs, config, ... }: {
-            packages = [ self.packages.${system}.main ];
+            packages = [ self.packages.${system}.main pkgs.fish pkgs.zsh ];
 
             processes.nws.exec = "exec ${self.packages.${system}.main}/bin/nws service";
 
@@ -66,6 +77,7 @@
 
             enterTest = ''
               odin test tests -collection:nwscore=src
+              bash ${./tests/completions_test.sh}
             '';
 
             enterShell = ''

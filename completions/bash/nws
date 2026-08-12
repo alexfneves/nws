@@ -1,0 +1,53 @@
+# bash completion for nws
+# Installed to share/bash-completion/completions/nws
+# Tracks `nws help`'s subcommand list: service register unregister list help.
+# register/unregister take an optional PATH; unregister also completes against
+# registered workspace canonical paths from `nws list` when the daemon is
+# reachable, falling back to filesystem completion otherwise.
+
+_nws() {
+    local cur sub
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    sub="${COMP_WORDS[1]}"
+
+    # First token: complete subcommand names.
+    if (( COMP_CWORD == 1 )); then
+        COMPREPLY=( $(compgen -W "service register unregister list help" -- "$cur") )
+        return
+    fi
+
+    case "$sub" in
+        register)
+            # filesystem path relative to cwd
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            ;;
+        unregister)
+            _nws_registered
+            # Fall back to filesystem when the daemon is unreachable or no
+            # registered name matches the current prefix.
+            if (( ${#COMPREPLY[@]} == 0 )); then
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            fi
+            ;;
+        *)  # service, list, help: no further tokens
+            COMPREPLY=()
+            ;;
+    esac
+}
+
+# Fill COMPREPLY with registered workspace canonical paths. Emits nothing and
+# leaves COMPREPLY empty when the daemon is unreachable (stdout won't start OK).
+_nws_registered() {
+    local out line
+    out=$(nws list 2>/dev/null) || { COMPREPLY=(); return; }
+    [[ "$out" == OK* ]] || { COMPREPLY=(); return; }
+    COMPREPLY=()
+    while IFS= read -r line; do
+        [[ "$line" == OK* ]] && continue     # skip the "OK <count>" header
+        [[ -n "$line" ]] || continue
+        # include only lines sharing the current prefix (spaces preserved)
+        [[ "$line" == "$cur"* ]] && COMPREPLY+=( "$line" )
+    done <<< "$out"
+}
+
+complete -F _nws nws

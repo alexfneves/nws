@@ -20,7 +20,9 @@ end
 complete -c nws -f -n "__fish_use_subcommand" \
     -a "service register unregister list help"
 
-# register: filesystem path.
+# register: filesystem path, plus overlay flags when the word starts with "--".
+complete -c nws -f -n '__fish_seen_subcommand_from register; and string match -q -- "-*" (commandline -ct)' \
+    -a "--overlay\tURL of an overlay flake --attr-path\tattribute path for the last --overlay --overlay-attr\toverlay attribute name --no-flake\tnon-flake overlay expression --nixpkgs\tnixpkgs URL"
 complete -c nws -f -n "__fish_seen_subcommand_from register" \
     -a "(__fish_complete_path)"
 

@@ -18,8 +18,12 @@ _nws() {
 
     case "$sub" in
         register)
-            # filesystem path relative to cwd
-            COMPREPLY=( $(compgen -f -- "$cur") )
+            # flags when the word starts with "--", filesystem paths otherwise
+            if [[ "$cur" == --* ]]; then
+                COMPREPLY=( $(compgen -W "--overlay --attr-path --overlay-attr --no-flake --nixpkgs" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            fi
             ;;
         unregister)
             _nws_registered

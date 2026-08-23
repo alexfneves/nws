@@ -75,6 +75,8 @@ The unit runs `%h/.nix-profile/bin/nws service` and restarts on failure
 ```
 nws service [--config-path PATH]  run the daemon (watches workspaces, serves the control socket)
 nws register [PATH]     add a workspace (default: current directory)
+                        overlay options: --overlay URL --attr-path ATTR
+                        [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]
 nws unregister [PATH]   remove a workspace
 nws list                list registered workspaces
 nws help                show this help
@@ -220,8 +222,32 @@ Sibling dependencies are resolved by the package-set fixed point (attribute
 name shadowing), not by nws — removing a clone naturally falls back to the
 upstream package.
 
-Configure it with an object entry in `workspaces` (legacy string entries keep
-the default flake backend):
+### Registering an overlay workspace from the CLI
+
+The easiest way is `nws register` with the overlay flags — no hand-editing of
+`config.json` required:
+
+```bash
+# ROS 1 noetic overlay:
+nws register /tmp/ws \
+  --overlay github:lopsided98/nix-ros-overlay/ros1-25.05 \
+  --attr-path rosPackages.noetic
+
+# Non-flake overlay with a named attribute and explicit nixpkgs:
+nws register /tmp/ws2 \
+  --overlay 'github:foo/bar' --attr-path pkgs --overlay-attr myOverlay \
+  --no-flake --nixpkgs github:NixOS/nixpkgs/nixos-25.05
+```
+
+- `--overlay URL` may be repeated for multiple entries; each pairs with the
+  following `--attr-path`. An `--overlay` without its `--attr-path` is a
+  usage error, as is an `--attr-path`/`--overlay-attr`/`--no-flake` with no
+  preceding `--overlay`.
+- Presence of any `--overlay` selects the overlay backend; plain
+  `nws register <path>` keeps the default flake backend.
+
+Manual configuration remains possible with an object entry in `workspaces`
+(legacy string entries keep the default flake backend):
 
 ```json
 {
@@ -305,7 +331,8 @@ nix profile install .#main
 What completes:
 
 - `nws <TAB>` — subcommands `service register unregister list help`.
-- `nws register <TAB>` — filesystem paths.
+- `nws register <TAB>` — filesystem paths; `--<TAB>` offers the overlay flags
+  (`--overlay`, `--attr-path`, `--overlay-attr`, `--no-flake`, `--nixpkgs`).
 - `nws unregister <TAB>` — registered workspace canonical paths, **only while
   the daemon is reachable**; falls back to plain filesystem completion
   otherwise (never hangs).
@@ -316,6 +343,20 @@ Raw newline-delimited TCP on `127.0.0.1:<port>` — no HTTP. One request line
 in, one reply line out (`OK`, `ERROR <msg>`, or `OK n` plus paths for
 `LIST`). Paths are percent-encoded so spaces and `%` round-trip safely.
 
+`REGISTER` optionally takes a query-string suffix carrying backend options:
+
+```
+REGISTER /home/you/ros-ws?backend=overlay&overlay=<pct(url)>&attrPath=<pct(attr)>
+```
+
+The path segment escapes space, `%`, `?`, `&`, and `=`, so the first `?`
+unambiguously starts the query. Query keys: `backend=overlay`; repeatable
+`overlay=`/`attrPath=` pairs (each overlay needs its attrPath); optional
+`overlayAttr=` and `flake=false` applying to the latest overlay; and optional
+workspace-level `nixpkgs=`. A bare legacy `REGISTER <pct(path)>` keeps the
+default flake backend. Malformed requests (bad escapes, unsupported backend,
+incomplete pairing) get an `ERROR` reply.
+
 ```
 $ printf 'LIST\n' | nc 127.0.0.1 17424
 OK 1
@@ -325,9 +366,11 @@ OK 1
 ## Manual verification checklist
 
 1. `nix build .#main && devenv test`.
-2. Register an overlay workspace (ROS-style config above); confirm the
-   generated flake has the managed header, follows the overlay's nixpkgs, and
-   splices a sample package dir at the configured attrPath.
+2. Register an overlay workspace via the CLI:
+   `result/bin/nws register /tmp/ros-ws --overlay github:lopsided98/nix-ros-overlay/master --attr-path rosPackages.humble`;
+   confirm config.json now contains the overlay workspace object, the
+   generated flake has the managed header, follows the overlay's nixpkgs,
+   and splices a sample package dir at the configured attrPath.
 3. Touch a file in a child dir → regenerates identically (byte-skip, no loop).
 4. Delete a child dir → its attribute disappears and the upstream overlay
    package falls through.

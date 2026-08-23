@@ -5,8 +5,9 @@ import "core:strings"
 // encode percent-encodes a path for the wire: space -> "%20", '%' -> "%25",
 // all other bytes (including '/') are passed through unchanged.
 encode :: proc(path: string, allocator := context.allocator) -> string {
+	// No builder_destroy: strings.to_string consumes the backing buffer and
+	// we free it explicitly after cloning.
 	b := strings.builder_make(allocator)
-	defer strings.builder_destroy(&b)
 
 	for i in 0 ..< len(path) {
 		c := path[i]
@@ -20,26 +21,34 @@ encode :: proc(path: string, allocator := context.allocator) -> string {
 		}
 	}
 
-	return strings.clone(strings.to_string(b), allocator)
+	out := strings.to_string(b)
+	res := strings.clone(out, allocator)
+	delete(out)
+	return res
 }
 
 // decode reverses percent-encoding: "%20" -> space, "%25" -> '%'. Returns
 // (decoded, ok); ok=false if the input ends with a dangling '%' or contains
 // a malformed hex escape.
 decode :: proc(s: string, allocator := context.allocator) -> (string, bool) {
+	// No builder_destroy: strings.to_string consumes the backing buffer and
+	// we free it explicitly after cloning.
 	b := strings.builder_make(allocator)
-	defer strings.builder_destroy(&b)
 
 	i := 0
 	for i < len(s) {
 		c := s[i]
 		if c == '%' {
 			if i + 2 >= len(s) {
+				partial := strings.to_string(b)
+				delete(partial)
 				return "", false
 			}
 			hi := hex_val(s[i + 1])
 			lo := hex_val(s[i + 2])
 			if hi < 0 || lo < 0 {
+				partial := strings.to_string(b)
+				delete(partial)
 				return "", false
 			}
 			strings.write_byte(&b, u8(hi * 16 + lo))
@@ -50,7 +59,10 @@ decode :: proc(s: string, allocator := context.allocator) -> (string, bool) {
 		}
 	}
 
-	return strings.clone(strings.to_string(b), allocator), true
+	out := strings.to_string(b)
+	res := strings.clone(out, allocator)
+	delete(out)
+	return res, true
 }
 
 // hex_val returns the value of a single hex digit, or -1 if the byte is not

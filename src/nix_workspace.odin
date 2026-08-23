@@ -104,11 +104,11 @@ main :: proc() {
 		}
 		run_service(config_path_override)
 	case "register":
-		arg := ""
-		if len(args) > 1 {
-			arg = args[1]
+		rest := args[1:]
+		if len(rest) == 0 {
+			rest = [](string){}
 		}
-		cmd_register(arg)
+		cmd_register(rest)
 	case "unregister":
 		arg := ""
 		if len(args) > 1 {
@@ -133,6 +133,8 @@ print_usage :: proc() {
 		"  nws service [--config-path PATH]  run the daemon (watches workspaces, serves the control socket)",
 	)
 	fmt.println("  nws register [PATH]     add a workspace (default: current directory)")
+	fmt.println("                          overlay options: --overlay URL --attr-path ATTR")
+	fmt.println("                          [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]")
 	fmt.println("  nws unregister [PATH]   remove a workspace")
 	fmt.println("  nws list                list registered workspaces")
 	fmt.println("  nws help                show this help")
@@ -231,24 +233,132 @@ tcp_request :: proc(port: int, line: string) -> (ok: bool, data: string) {
 	return true, strings.clone(strings.to_string(b), context.allocator)
 }
 
-cmd_register :: proc(arg: string) {
-	port := client_port()
-	path := resolve_path(arg)
-	enc := core.encode(path)
-	defer {
-		delete(enc)
-		delete(path)
+// register_options holds the parsed CLI flags of `nws register`.
+Register_Options :: struct {
+	path:     string,
+	overlays: [dynamic]core.Overlay_Entry,
+	nixpkgs:  string,
+}
+
+cmd_register :: proc(argv: []string) {
+	opts, ok := parse_register_flags(argv)
+	if !ok {
+		return // parse_register_flags already printed the error
 	}
+	defer delete(opts.overlays)
+
+	port := client_port()
+	path := resolve_path(opts.path)
+	defer delete(path)
+
+	// req borrows path/opts strings; register_encode only reads them.
+	req: core.Register_Request = core.Register_Request {
+		path        = path,
+		nixpkgs_url = opts.nixpkgs,
+	}
+	if len(opts.overlays) > 0 {
+		req.is_overlay = true
+		req.overlays = opts.overlays
+	}
+	enc := core.register_encode(&req)
+	defer delete(enc)
 	line := strings.concatenate({"REGISTER ", enc, "\n"}, context.allocator)
 	defer delete(line)
 
-	ok, reply := tcp_request(port, line)
-	if !ok {
+	sent, reply := tcp_request(port, line)
+	if !sent {
 		fmt.println("nws: cannot reach daemon on 127.0.0.1:", port, "- is the daemon running?")
 		return
 	}
 	defer delete(reply)
 	fmt.println(strings.trim_space(reply))
+}
+
+// parse_register_flags parses the argument vector of `nws register`. Flags:
+// --overlay URL (repeatable), --attr-path ATTR (pairs with the preceding
+// --overlay), --overlay-attr NAME and --no-flake (apply to the latest
+// overlay), --nixpkgs URL, plus at most one positional PATH. On a usage
+// error it prints a message to stderr and returns ok=false.
+parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: bool) {
+	fail :: proc(msg: string) {
+		fmt.eprintln("nws register:", msg)
+		fmt.eprintln(
+			"usage: nws register [PATH] [--overlay URL --attr-path ATTR ...] [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]",
+		)
+	}
+
+	i := 0
+	for i < len(argv) {
+		a := argv[i]
+		switch a {
+		case "--overlay":
+			if i + 1 >= len(argv) {
+				fail("--overlay requires a URL")
+				return opts, false
+			}
+			append(&opts.overlays, core.Overlay_Entry{url = argv[i + 1], is_flake = true})
+			i += 2
+		case "--attr-path":
+			if i + 1 >= len(argv) {
+				fail("--attr-path requires a value")
+				return opts, false
+			}
+			if len(opts.overlays) == 0 {
+				fail("--attr-path without a preceding --overlay")
+				return opts, false
+			}
+			opts.overlays[len(opts.overlays) - 1].attr_path = argv[i + 1]
+			i += 2
+		case "--overlay-attr":
+			if i + 1 >= len(argv) {
+				fail("--overlay-attr requires a name")
+				return opts, false
+			}
+			if len(opts.overlays) == 0 {
+				fail("--overlay-attr without a preceding --overlay")
+				return opts, false
+			}
+			opts.overlays[len(opts.overlays) - 1].overlay_attr = argv[i + 1]
+			i += 2
+		case "--no-flake":
+			if len(opts.overlays) == 0 {
+				fail("--no-flake without a preceding --overlay")
+				return opts, false
+			}
+			opts.overlays[len(opts.overlays) - 1].is_flake = false
+			i += 1
+		case "--nixpkgs":
+			if i + 1 >= len(argv) {
+				fail("--nixpkgs requires a URL")
+				return opts, false
+			}
+			opts.nixpkgs = argv[i + 1]
+			i += 2
+		case:
+			if strings.has_prefix(a, "--") {
+				fmt.eprintln("nws register: unknown flag:", a)
+				return opts, false
+			}
+			if opts.path != "" {
+				fail("multiple PATH arguments given")
+				return opts, false
+			}
+			opts.path = a
+			i += 1
+		}
+	}
+
+	if len(opts.overlays) > 0 {
+		for ov, idx in opts.overlays {
+			if ov.attr_path == "" {
+				fail(fmt.tprintf("--overlay %q is missing its paired --attr-path", ov.url))
+				return opts, false
+			}
+			_ = idx
+		}
+	}
+
+	return opts, true
 }
 
 cmd_unregister :: proc(arg: string) {
@@ -385,7 +495,7 @@ run_service :: proc(config_path_override: string = "") {
 	// Re-establish all configured workspaces (initial sync materialises an
 	// already-present clone immediately, without waiting for an event).
 	for ws in cfg.workspaces {
-		#partial switch add_workspace(&state, ws.name) {
+		#partial switch add_workspace(&state, ws.name, nil) {
 		case .Not_Dir:
 			log_line(
 				logging,
@@ -518,14 +628,51 @@ route_command :: proc(state: ^Daemon_State, line: string) -> string {
 
 	switch verb {
 	case "REGISTER":
-		dec, ok := core.decode(rest)
-		if !ok {
-			return strings.clone("ERROR bad path encoding\n", context.allocator)
+		req, pok := core.register_parse(rest)
+		if !pok {
+			return strings.clone(
+				"ERROR bad REGISTER request (bad escape, unsupported backend, or incomplete --overlay/--attr-path pairing)\n",
+				context.allocator,
+			)
 		}
-		defer delete(dec)
-		norm := normalize_path(dec)
+		defer core.register_free(&req)
+		norm := normalize_path(req.path)
 		defer delete(norm)
-		switch add_workspace(state, norm) {
+
+		// Overlay request → build the full backend config so it lands in
+		// ws_cfgs and survives save_state_config. Legacy request → nil (flake).
+		// NOTE: freed via a CASE-LEVEL conditional defer — a defer inside the
+		// if-block below would fire before add_workspace consumes the config.
+		wscfg: core.Workspace_Config
+		have_cfg := false
+		defer if have_cfg {
+			core.delete_workspace_config(wscfg)
+		}
+		if req.is_overlay {
+			wscfg = core.Workspace_Config {
+				name        = strings.clone(norm),
+				kind        = .overlay,
+				nixpkgs_url = req.nixpkgs_url != "" ? strings.clone(req.nixpkgs_url) : "",
+			}
+			wscfg.overlays = make([dynamic]core.Overlay_Entry, 0, len(req.overlays))
+			for ov in req.overlays {
+				append(
+					&wscfg.overlays,
+					core.Overlay_Entry {
+						url = strings.clone(ov.url),
+						attr_path = strings.clone(ov.attr_path),
+						overlay_attr = ov.overlay_attr != "" ? strings.clone(ov.overlay_attr) : "",
+						is_flake = ov.is_flake,
+					},
+				)
+			}
+			have_cfg = true
+		}
+		cfg_ptr: ^core.Workspace_Config
+		if have_cfg {
+			cfg_ptr = &wscfg
+		}
+		switch add_workspace(state, norm, cfg_ptr) {
 		case .OK:
 			return strings.clone("OK\n", context.allocator)
 		case .Already_Registered:
@@ -572,7 +719,11 @@ list_reply :: proc(state: ^Daemon_State) -> string {
 // Workspace management
 // ---------------------------------------------------------------------------
 
-add_workspace :: proc(state: ^Daemon_State, path: string) -> Add_Result {
+add_workspace :: proc(
+	state: ^Daemon_State,
+	path: string,
+	wscfg: ^core.Workspace_Config,
+) -> Add_Result {
 	if !os.is_dir(path) {
 		return .Not_Dir
 	}
@@ -587,7 +738,12 @@ add_workspace :: proc(state: ^Daemon_State, path: string) -> Add_Result {
 		return .Watch_Failed
 	}
 
-	append(&state.ws, Workspace{path = strings.clone(path, context.allocator), wd = wd})
+	if wscfg != nil {
+		key := strings.clone(path)
+		state.ws_cfgs[key] = core.clone_workspace_config(wscfg^)
+	}
+
+	append(&state.ws, Workspace{path = strings.clone(path), wd = wd})
 	log_line(state.logging, "added workspace %q (wd %d)", path, wd)
 
 	// Materialise an already-present clone immediately, then persist.
@@ -1077,7 +1233,8 @@ attr_names_cached :: proc(
 // No timeout in v1 — accepted inline blocking, debounced by the byte-equal
 // write skip. The returned map owns cloned name strings.
 run_nix_eval :: proc(ov: core.Overlay_Entry) -> (map[string]bool, bool) {
-	attr_ref := fmt.tprintf("%s#%s", ov.url, ov.attr_path)
+	// fmt.aprintf (not tprintf): attr_ref is heap-owned and deleted below.
+	attr_ref := fmt.aprintf("%s#%s", ov.url, ov.attr_path)
 	defer delete(attr_ref)
 	desc := os.Process_Desc {
 		command = []string{"nix", "eval", "--json", attr_ref, "--apply", "builtins.attrNames"},

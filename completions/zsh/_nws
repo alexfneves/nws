@@ -16,7 +16,13 @@ _nws() {
 
     case $words[2] in
         register)
-            _files
+            local -a reg_flags
+            reg_flags=(--overlay --attr-path --overlay-attr --no-flake --nixpkgs)
+            if [[ "$words[CURRENT]" == -* ]]; then
+                _describe 'flag' reg_flags
+            else
+                _files
+            fi
             ;;
         unregister)
             if _nws_registered && (( ${#_nws_ws[@]} > 0 )); then

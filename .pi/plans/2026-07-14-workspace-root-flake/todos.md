@@ -17,7 +17,7 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Acceptance: save→load roundtrip equals input; save is atomic; stale workspace entries prunable.
 - Anti-pattern: do NOT write state non-atomically (ISC-A-3).
 
-## T2: Add `core/root_flake.odin` — deterministic generator
+## T2: Add `core/root_flake.odin` — deterministic generator — DONE ✅
 - Files: `src/core/root_flake.odin` (new), `tests/root_flake_test.odin` (new)
 - Reference: reuse marker semantics from `src/core/flake.odin:extract_marker`; children enumeration already exists in `src/nix_workspace.odin:750 local_repos`.
 - Shape:
@@ -32,7 +32,7 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Tests: golden exact-string output; generate-twice determinism; unsorted input → sorted output; no-URL child; no duplicate markers.
 - Anti-pattern: do NOT iterate directory order — sort names (ISC-10).
 
-## T3: Git-remote resolution via `.git/config` parse
+## T3: Git-remote resolution via `.git/config` parse — DONE ✅
 - Files: `src/core/git_remote.odin` (new), `tests/git_remote_test.odin` (new)
 - Read `<child>/.git/config`, find `[remote "origin"]` section, return its `url =` value. Fail-open: any unexpected layout → no URL. No subprocesses (single-threaded event loop must not block).
 - Tests: normal config, worktree-style `.git` file (returns none), missing file, multiple remotes (origin wins).

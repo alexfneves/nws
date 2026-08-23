@@ -705,19 +705,49 @@ process_inotify_event :: proc(state: ^Daemon_State, ev: ^linux.Inotify_Event, lo
 }
 
 // ---------------------------------------------------------------------------
-// Flake sync
+// Root flake generation & sync
 // ---------------------------------------------------------------------------
 
-sync_workspace :: proc(state: ^Daemon_State, path: string) {
-	flake := strings.concatenate({path, "/flake.nix"}, context.allocator)
-	defer delete(flake)
+// state_path resolves the persisted canonical-URL state file location:
+// alongside the config file (e.g. ~/.config/nws/state.json), honouring any
+// --config-path override's directory.
+state_path :: proc(state: ^Daemon_State) -> string {
+	return strings.concatenate({filepath.dir(state.config_path), "/state.json"}, context.allocator)
+}
 
-	data, rerr := os.read_entire_file(flake, context.allocator)
-	if rerr != nil {
-		return // no flake.nix yet — nothing to do
+// atomic_write writes text to path via a temp file + rename in the same
+// directory, so readers never observe a partial file.
+atomic_write :: proc(path, text: string, logging: bool, what: string) -> bool {
+	tmp := strings.concatenate({path, ".tmp"}, context.allocator)
+	defer delete(tmp)
+	if err := os.write_entire_file(tmp, text); err != nil {
+		os.remove(tmp)
+		log_line(logging, "failed to write %s: %v", tmp, err)
+		return false
 	}
-	defer delete(data)
-	text := string(data)
+	if err := os.rename(tmp, path); err != nil {
+		log_line(logging, "failed to rename %s: %v", tmp, err)
+		return false
+	}
+	log_line(logging, "%s %s", what, path)
+	return true
+}
+
+// sync_workspace regenerates the workspace ROOT flake.nix from the current
+// set of first-level children. Children are never modified: their flakes are
+// only read (via their .git/config for the canonical URL). Write policy:
+//
+//   - no root flake        → create the generated one
+//   - nws-managed root     → atomic-write only when bytes differ
+//   - user-authored root   → log and never touch
+sync_workspace :: proc(state: ^Daemon_State, path: string) {
+	fl_path := strings.concatenate({path, "/flake.nix"}, context.allocator)
+	defer delete(fl_path)
+
+	sp := state_path(state)
+	defer delete(sp)
+	st, _ := core.load_state(sp)
+	defer core.destroy_state(&st)
 
 	local := local_repos(path)
 	defer {
@@ -727,22 +757,71 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		delete(local)
 	}
 
-	new_text, changed := core.sync_flake(text, local[:])
-	if !changed {
-		delete(new_text)
+	children := make([dynamic]core.Child_Info, 0, len(local))
+	defer {
+		for c in children {
+			if c.has_url {
+				delete(c.url)
+			}
+		}
+		delete(children)
+	}
+
+	state_dirty := false
+	for name in local {
+		child := core.Child_Info {
+			name = name,
+		} // borrows local[i]; freed above
+
+		// strings.concatenate (heap) so we can delete it; fmt.tprintf uses
+		// the temporary allocator and must never be freed manually.
+		child_dir := strings.concatenate({path, "/", name}, context.allocator)
+		url, ok := core.read_origin_url(child_dir)
+		delete(child_dir)
+
+		if ok {
+			child.url = url
+			child.has_url = true
+			stored, has := core.lookup_url(&st, path, name)
+			if !has || stored != url {
+				core.upsert_url(&st, path, name, url)
+				state_dirty = true
+			}
+		} else if stored, has := core.lookup_url(&st, path, name); has {
+			child.url = strings.clone(stored)
+			child.has_url = true
+		}
+		append(&children, child)
+	}
+
+	defer {
+		if state_dirty {
+			if !core.save_state(sp, &st) {
+				log_line(state.logging, "failed to save state %s", sp)
+			}
+		}
+	}
+
+	generated := core.generate_root_flake(children[:])
+	defer delete(generated)
+
+	existing, rerr := os.read_entire_file(fl_path, context.allocator)
+	if rerr != nil {
+		// No root flake yet: create the generated one on this event.
+		atomic_write(fl_path, generated, state.logging, "generated")
 		return
 	}
-	defer delete(new_text)
+	defer delete(existing)
 
-	tmp := strings.concatenate({flake, ".tmp"}, context.allocator)
-	defer delete(tmp)
-	if err := os.write_entire_file(tmp, new_text); err == nil {
-		os.rename(tmp, flake)
-		log_line(state.logging, "rewrote %s", flake)
-	} else {
-		os.remove(tmp)
-		log_line(state.logging, "failed to write %s: %v", tmp, err)
+	if !core.is_managed_root(string(existing)) {
+		log_line(state.logging, "skipping user-authored %s", fl_path)
+		return
 	}
+
+	if string(existing) == generated {
+		return // byte-identical: no write, so no self-trigger loop
+	}
+	atomic_write(fl_path, generated, state.logging, "regenerated")
 }
 
 // local_repos returns the first-level subfolders of path that look like local

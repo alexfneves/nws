@@ -94,6 +94,24 @@ test_match_sorting_deterministic :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_match_ancestor_out_of_order :: proc(t: ^testing.T) {
+	// Robustness guard: even if an ancestor match appears *after* its
+	// descendant in the candidate list (not produced by well-formed candidate
+	// sets, but must not corrupt iteration), only the deepest survives.
+	names := attr_set("repo", "sub")
+	defer delete(names)
+	candidates := []string{"repo/sub", "repo", "unrelated"}
+	got := core.match_overlay_children(candidates, names)
+	defer delete(got)
+	testing.expectf(
+		t,
+		len(got) == 1 && got[0] == "repo/sub",
+		"expected only repo/sub, got %v",
+		got,
+	)
+}
+
+@(test)
 test_match_basename_only :: proc(t: ^testing.T) {
 	// A candidate matches on its basename even when the full path differs
 	// from the attribute name (monorepo case).

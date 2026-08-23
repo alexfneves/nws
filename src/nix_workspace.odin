@@ -649,8 +649,15 @@ drop_workspace_wd :: proc(state: ^Daemon_State, wd: linux.Wd) {
 forget_workspace_config :: proc(state: ^Daemon_State, path: string) {
 	if cfg, ok := state.ws_cfgs[path]; ok {
 		core.delete_workspace_config(cfg)
-		delete_key(&state.ws_cfgs, path)
-		delete(path) // key was cloned on insert
+		// The map key is a distinct cloned buffer (strings.clone at insert);
+		// never delete the caller-owned `path`. Find and free the real key.
+		for k in state.ws_cfgs {
+			if k == path {
+				delete_key(&state.ws_cfgs, k)
+				delete(k)
+				break
+			}
+		}
 	}
 }
 
@@ -1071,6 +1078,7 @@ attr_names_cached :: proc(
 // write skip. The returned map owns cloned name strings.
 run_nix_eval :: proc(ov: core.Overlay_Entry) -> (map[string]bool, bool) {
 	attr_ref := fmt.tprintf("%s#%s", ov.url, ov.attr_path)
+	defer delete(attr_ref)
 	desc := os.Process_Desc {
 		command = []string{"nix", "eval", "--json", attr_ref, "--apply", "builtins.attrNames"},
 	}

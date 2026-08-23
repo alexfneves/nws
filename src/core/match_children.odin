@@ -21,44 +21,35 @@ match_overlay_children :: proc(
 	attr_names: map[string]bool,
 	allocator := context.allocator,
 ) -> []string {
+	// Pass 1: collect every candidate whose basename is an attr name.
 	matched := make([dynamic]string, 0, len(candidates), allocator)
 	for c in candidates {
-		if !attr_names[path_basename(c)] {
-			continue
-		}
-		keep := true
-		for m in matched {
-			if strings.has_prefix(m, c) && len(m) > len(c) && m[len(c)] == '/' {
-				// A previously accepted deeper candidate sits under this one:
-				// drop this shallower ancestor.
-				keep = false
-				break
-			}
-			if strings.has_prefix(c, m) && len(c) > len(m) && c[len(m)] == '/' {
-				// This candidate is a strict path-prefix of an earlier one —
-				// cannot happen with well-formed candidate sets (parents come
-				// first), but guard for robustness.
-				remove_idx := -1
-				for mm, i in matched {
-					if mm == m {
-						remove_idx = i
-						break
-					}
-				}
-				if remove_idx >= 0 {
-					unordered_remove(&matched, remove_idx)
-				}
-			}
-		}
-		if keep {
+		if attr_names[path_basename(c)] {
 			append(&matched, c)
 		}
 	}
 
-	slice.sort_by(matched[:], proc(a, b: string) -> bool {
+	// Pass 2: deepest-match-wins. Drop any match that is a strict path
+	// prefix of another match. No mutation while iterating.
+	result := make([dynamic]string, 0, len(matched), allocator)
+	for m in matched {
+		keep := true
+		for o in matched {
+			if o != m && len(o) > len(m) && strings.has_prefix(o, m) && o[len(m)] == '/' {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			append(&result, m)
+		}
+	}
+	delete(matched)
+
+	slice.sort_by(result[:], proc(a, b: string) -> bool {
 		return a < b
 	})
-	return matched[:]
+	return result[:]
 }
 
 // path_basename returns everything after the last '/' in p (or p itself).
@@ -71,12 +62,4 @@ path_basename :: proc(p: string) -> string {
 		}
 	}
 	return p[last + 1:]
-}
-
-// unordered_remove removes element at index i from a dynamic slice without
-// preserving order (swap-with-last).
-unordered_remove :: proc(d: ^[dynamic]string, i: int) {
-	last := len(d) - 1
-	d[i] = d[last]
-	pop(d)
 }

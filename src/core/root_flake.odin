@@ -81,8 +81,9 @@ generate_root_flake :: proc(children: []Child_Info, allocator := context.allocat
 }
 
 // root_flake_outputs emits the `outputs` section delegating the children's
-// packages/devShells/apps/checks under `<child>-` prefixed attribute names.
-// With zero children every delegated output is simply an empty attrset.
+// packages/devShells/apps/checks under `<child>-` prefixed attribute names,
+// grouped per system: packages.<sys>.<child>-<attr>. With zero children every
+// delegated output is simply an empty attrset.
 root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	strings.write_string(b, `  outputs = { self, ... }@inputs:` + "\n")
 	strings.write_string(b, "  let\n")
@@ -93,25 +94,29 @@ root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 		strings.write_string(b, `"`)
 	}
 	strings.write_string(b, ` ];` + "\n")
-	strings.write_string(b, `    delegate = out:` + "\n")
-	strings.write_string(b, `      builtins.listToAttrs (builtins.concatMap` + "\n")
-	strings.write_string(b, `        (child:` + "\n")
-	strings.write_string(b, `          let v = inputs.${child}.${out} or null; in` + "\n")
-	strings.write_string(b, `          if v == null then [] else` + "\n")
-	strings.write_string(b, `          builtins.attrValues (builtins.mapAttrs` + "\n")
-	strings.write_string(b, `            (sys: val: {` + "\n")
-	strings.write_string(b, `              name = sys;` + "\n")
-	strings.write_string(b, `              value = builtins.listToAttrs (builtins.map` + "\n")
+	strings.write_string(b, `    systemsOf = out:` + "\n")
 	strings.write_string(
 		b,
-		`                (attrName: { name = "${child}-${attrName}"; value = v.${attrName}; })` +
+		`      builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children;` +
 		"\n",
 	)
-	strings.write_string(b, `                (builtins.attrNames v));` + "\n")
-	strings.write_string(b, `            })` + "\n")
-	strings.write_string(b, `            v)` + "\n")
-	strings.write_string(b, `        )` + "\n")
-	strings.write_string(b, `        children);` + "\n")
+	strings.write_string(b, `    delegate = out:` + "\n")
+	strings.write_string(b, `      builtins.mapAttrs` + "\n")
+	strings.write_string(b, `        (sys: _:` + "\n")
+	strings.write_string(b, `          builtins.listToAttrs (builtins.concatMap` + "\n")
+	strings.write_string(b, `            (child:` + "\n")
+	strings.write_string(
+		b,
+		`              let v = inputs.${child}.${out}.${sys} or null; in` + "\n",
+	)
+	strings.write_string(b, `              if v == null then [] else` + "\n")
+	strings.write_string(b, `              builtins.attrValues (builtins.mapAttrs` + "\n")
+	strings.write_string(
+		b,
+		`                (attrName: val: { name = "${child}-${attrName}"; inherit val; })` + "\n",
+	)
+	strings.write_string(b, `                v))` + "\n")
+	strings.write_string(b, `            children));` + "\n")
 	strings.write_string(b, "  in\n")
 	strings.write_string(b, "  {\n")
 	strings.write_string(b, `    packages = delegate "packages";` + "\n")

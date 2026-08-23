@@ -50,9 +50,17 @@ generate_root_flake :: proc(children: []Child_Info, allocator := context.allocat
 		strings.write_string(&b, "  inputs = {\n")
 		for c in sorted {
 			strings.write_string(&b, "    ")
-			strings.write_string(&b, c.name)
+			if is_nix_identifier(c.name) {
+				strings.write_string(&b, c.name)
+			} else {
+				// Not a bare identifier: emit as a quoted attrset key so the
+				// generated flake stays syntactically valid.
+				strings.write_string(&b, "\"")
+				nix_escape_string(&b, c.name)
+				strings.write_string(&b, "\"")
+			}
 			strings.write_string(&b, `.url = "path:./`)
-			strings.write_string(&b, c.name)
+			nix_escape_string(&b, c.name)
 			strings.write_string(&b, `";`)
 			if c.has_url {
 				// Same `# nws: <canonical>` marker semantics as flake.odin;
@@ -83,7 +91,7 @@ root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	strings.write_string(b, `    children = [`)
 	for c in sorted {
 		strings.write_string(b, ` "`)
-		strings.write_string(b, c.name)
+		nix_escape_string(b, c.name)
 		strings.write_string(b, `"`)
 	}
 	strings.write_string(b, ` ];` + "\n")
@@ -113,6 +121,48 @@ root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	strings.write_string(b, `    apps = delegate "apps";` + "\n")
 	strings.write_string(b, `    checks = delegate "checks";` + "\n")
 	strings.write_string(b, "  };\n")
+}
+
+// is_nix_identifier reports whether name is a valid bare Nix identifier
+// ([A-Za-z_][A-Za-z0-9_'-]*), usable directly as an attrset key.
+is_nix_identifier :: proc(name: string) -> bool {
+	if len(name) == 0 {
+		return false
+	}
+	for c, i in name {
+		alpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		if i == 0 {
+			if !alpha {
+				return false
+			}
+		} else if !alpha && !('0' <= c && c <= '9') && c != '\'' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// nix_escape_string writes s into b escaped for safe inclusion inside a
+// double-quoted Nix string literal: backslash, double quote, and the `${`
+// anti-quotation sequence are neutralised.
+nix_escape_string :: proc(b: ^strings.Builder, s: string) {
+	i := 0
+	for i < len(s) {
+		switch {
+		case s[i] == '"':
+			strings.write_string(b, `\"`)
+			i += 1
+		case s[i] == '\\':
+			strings.write_string(b, `\\`)
+			i += 1
+		case s[i] == '$' && i + 1 < len(s) && s[i + 1] == '{':
+			strings.write_string(b, `\${`)
+			i += 2
+		case:
+			strings.write_string(b, s[i:i + 1])
+			i += 1
+		}
+	}
 }
 
 // is_managed_root reports whether the given flake text starts with the

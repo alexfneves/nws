@@ -97,11 +97,12 @@ save_state :: proc(path: string, s: ^State, allocator := context.allocator) -> b
 
 	tmp := fmt.tprintf("%s.tmp", path)
 	if err := os.write_entire_file(tmp, text); err != nil {
+		os.remove(tmp)
 		return false
 	}
-	defer os.remove(tmp)
 
 	if err := os.rename(tmp, path); err != nil {
+		os.remove(tmp)
 		return false
 	}
 	return true

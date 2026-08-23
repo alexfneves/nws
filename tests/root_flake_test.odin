@@ -243,3 +243,60 @@ test_is_managed_root :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, !core.is_managed_root(""), "empty text is not managed")
 }
+
+// Names that are not valid bare Nix identifiers must be emitted as quoted,
+// escaped string keys, and any name embedded in a string literal must have
+// `"`, `\`, and `${` escaped so the generated flake stays syntactically valid.
+@(test)
+test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
+	children := []core.Child_Info {
+		{name = `weird-name`, has_url = false},
+		{name = `has"quote`, has_url = false},
+		{name = "has${dollar}", has_url = false},
+	}
+
+	got := core.generate_root_flake(children)
+	defer delete(got)
+
+	want := `# nws-generated — do not edit
+{
+  inputs = {
+    "has\"quote".url = "path:./has\"quote";
+    "has\${dollar}".url = "path:./has\${dollar}";
+    weird-name.url = "path:./weird-name";
+  };
+  outputs = { self, ... }@inputs:
+  let
+    children = [ "has\"quote" "has\${dollar}" "weird-name" ];
+    delegate = out:
+      builtins.listToAttrs (builtins.concatMap
+        (child:
+          let v = inputs.${child}.${out} or null; in
+          if v == null then [] else
+          builtins.attrValues (builtins.mapAttrs
+            (sys: val: {
+              name = sys;
+              value = builtins.listToAttrs (builtins.map
+                (attrName: { name = "${child}-${attrName}"; value = v.${attrName}; })
+                (builtins.attrNames v));
+            })
+            v)
+        )
+        children);
+  in
+  {
+    packages = delegate "packages";
+    devShells = delegate "devShells";
+    apps = delegate "apps";
+    checks = delegate "checks";
+  };
+}
+`
+	testing.expectf(
+		t,
+		got == want,
+		"weird-name golden mismatch:\n--- got ---\n%s\n--- want ---\n%s",
+		got,
+		want,
+	)
+}

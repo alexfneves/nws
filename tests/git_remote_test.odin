@@ -134,6 +134,7 @@ test_read_origin_url_whitespace_and_comments :: proc(t: ^testing.T) {
 		},
 		"\n",
 	)
+	defer delete(contents)
 	write_file(t, fmt.tprintf("%s/.git", child), "config", contents)
 
 	url, ok := core.read_origin_url(child)

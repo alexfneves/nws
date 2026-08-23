@@ -823,6 +823,26 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		}
 	}
 
+	// Opportunistically prune state entries for workspaces that are no longer
+	// registered (deleted or unregistered since they were written).
+	stale := make([dynamic]string, 0, len(st.workspaces))
+	defer {
+		for p in stale {
+			delete(p)
+		}
+		delete(stale)
+	}
+	for ws_path in st.workspaces {
+		if !has_workspace(state, ws_path) {
+			append(&stale, strings.clone(ws_path))
+		}
+	}
+	for p in stale {
+		if core.prune_workspace(&st, p) {
+			state_dirty = true
+		}
+	}
+
 	defer {
 		if state_dirty {
 			if !core.save_state(sp, &st) {

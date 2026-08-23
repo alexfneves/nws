@@ -12,6 +12,7 @@ package main
 // keep (or return to) their canonical GitHub URL. It serves the control socket
 // on 127.0.0.1:<port> using a single-threaded, poll-multiplexed event loop.
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -51,6 +52,11 @@ Daemon_State :: struct {
 	// nixpkgs URL) keyed by canonical workspace path. Only overlay workspaces
 	// are present today; flake workspaces round-trip as the legacy string form.
 	ws_cfgs:     map[string]core.Workspace_Config,
+	// eval_cache memoises `nix eval` attr-name sets per "<url>\x1f<attrPath>"
+	// key so repeated syncs don't re-evaluate a (possibly network-fetching)
+	// overlay flake. Entries persist for the daemon's lifetime; on eval failure
+	// the cached set is reused (fail-open). Values own their cloned strings.
+	eval_cache:  map[string]map[string]bool,
 	clients:     [dynamic]Client,
 	config_path: string,
 	port:        int,
@@ -335,6 +341,7 @@ run_service :: proc(config_path_override: string = "") {
 
 	state := Daemon_State{}
 	state.ws_cfgs = make(map[string]core.Workspace_Config)
+	state.eval_cache = make(map[string]map[string]bool)
 	state.config_path = cfg_path
 	state.port = cfg.port
 	state.logging = logging
@@ -370,7 +377,8 @@ run_service :: proc(config_path_override: string = "") {
 	// round-trip them instead of degrading to the legacy string form.
 	for ws in cfg.workspaces {
 		if ws.kind == .overlay {
-			state.ws_cfgs[ws.name] = core.clone_workspace_config(ws)
+			key := strings.clone(ws.name)
+			state.ws_cfgs[key] = core.clone_workspace_config(ws)
 		}
 	}
 
@@ -642,6 +650,7 @@ forget_workspace_config :: proc(state: ^Daemon_State, path: string) {
 	if cfg, ok := state.ws_cfgs[path]; ok {
 		core.delete_workspace_config(cfg)
 		delete_key(&state.ws_cfgs, path)
+		delete(path) // key was cloned on insert
 	}
 }
 
@@ -764,6 +773,13 @@ atomic_write :: proc(path, text: string, logging: bool, what: string) -> bool {
 //   - nws-managed root     → atomic-write only when bytes differ
 //   - user-authored root   → log and never touch
 sync_workspace :: proc(state: ^Daemon_State, path: string) {
+	// Backend dispatch: overlay workspaces take a completely separate pipeline
+	// (no state.json, no .git probing, no sibling deps).
+	if cfg, ok := state.ws_cfgs[path]; ok && cfg.kind == .overlay {
+		sync_workspace_overlay(state, path, cfg)
+		return
+	}
+
 	fl_path := strings.concatenate({path, "/flake.nix"}, context.allocator)
 	defer delete(fl_path)
 
@@ -912,6 +928,177 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		return // byte-identical: no write, so no self-trigger loop
 	}
 	atomic_write(fl_path, generated, state.logging, "regenerated")
+}
+
+// ---------------------------------------------------------------------------
+// Overlay backend
+// ---------------------------------------------------------------------------
+
+// sync_workspace_overlay regenerates an overlay workspace's root flake.nix:
+// it scans candidate directories, resolves each configured overlay's package
+// attribute names via `nix eval` (cached), splices the matched children into
+// the generated template and applies the shared write policy (managed-root
+// gate + byte-equal skip). It deliberately skips state.json, .git/config and
+// sibling-dependency handling — none of that applies to overlay mode.
+sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Workspace_Config) {
+	fl_path := strings.concatenate({path, "/flake.nix"}, context.allocator)
+	defer delete(fl_path)
+
+	candidates := scan_candidates(path)
+	defer {
+		for c in candidates {
+			delete(c)
+		}
+		delete(candidates)
+	}
+
+	matched := make([dynamic]core.Overlay_Child, 0, len(candidates))
+	defer delete(matched)
+
+	for ov in cfg.overlays {
+		key := strings.concatenate({ov.url, "\x1f", ov.attr_path})
+		defer delete(key)
+		names, ok := attr_names_cached(state, key, ov)
+		if !ok {
+			continue // never-successful eval: splice nothing from this overlay
+		}
+		for rel in core.match_overlay_children(candidates[:], names) {
+			dup := false
+			for m in matched {
+				if m.rel_path == rel {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				append(
+					&matched,
+					core.Overlay_Child{name = core.path_basename(rel), rel_path = rel},
+				)
+			}
+		}
+	}
+
+	generated := core.generate_overlay_root_flake(matched[:], cfg)
+	defer delete(generated)
+
+	// Shared write policy (same as the flake backend).
+	existing, rerr := os.read_entire_file(fl_path, context.allocator)
+	if rerr != nil {
+		atomic_write(fl_path, generated, state.logging, "generated")
+		return
+	}
+	defer delete(existing)
+
+	if !core.is_managed_root(string(existing)) {
+		log_line(state.logging, "skipping user-authored %s", fl_path)
+		return
+	}
+	if string(existing) == generated {
+		return // byte-identical: no write, so no self-trigger loop
+	}
+	atomic_write(fl_path, generated, state.logging, "regenerated")
+}
+
+// scan_candidates lists every first-level directory of path plus each one's
+// immediate subdirectories, as workspace-root-relative paths (e.g. "repo",
+// "monorepo/pkg"). Unreadable directories are skipped silently (fail-open);
+// files are ignored.
+scan_candidates :: proc(path: string) -> [dynamic]string {
+	res := make([dynamic]string)
+	fis, derr := os.read_directory_by_path(path, -1, context.allocator)
+	if derr != nil {
+		return res
+	}
+	defer os.file_info_slice_delete(fis, context.allocator)
+	for fi in fis {
+		if fi.type != .Directory {
+			continue
+		}
+		rel := strings.clone(fi.name, context.allocator)
+		append(&res, rel)
+		sub_fis, serr := os.read_directory_by_path(fi.fullpath, -1, context.allocator)
+		if serr != nil {
+			continue // unreadable subdir parent: fail-open, keep the top level
+		}
+		defer os.file_info_slice_delete(sub_fis, context.allocator)
+		for sub in sub_fis {
+			if sub.type != .Directory {
+				continue
+			}
+			append(&res, strings.concatenate({rel, "/", sub.name}, context.allocator))
+		}
+	}
+	return res
+}
+
+// attr_names_cached returns the overlay's package attribute names, using the
+// daemon-lifetime cache when present. On eval failure the last cached set is
+// returned (fail-open); when there has never been a successful eval, ok is
+// false so the caller splices nothing rather than guessing.
+attr_names_cached :: proc(
+	state: ^Daemon_State,
+	key: string,
+	ov: core.Overlay_Entry,
+) -> (
+	map[string]bool,
+	bool,
+) {
+	if names, ok := state.eval_cache[key]; ok {
+		return names, true
+	}
+	names, ok := run_nix_eval(ov)
+	if !ok {
+		log_line(
+			state.logging,
+			"warning: nix eval failed for %s#%s — keeping previous set / splicing nothing",
+			ov.url,
+			ov.attr_path,
+		)
+		return nil, false
+	}
+	state.eval_cache[key] = names
+	return names, true
+}
+
+// run_nix_eval shells out to
+//
+//	nix eval --json <url>#<attrPath> --apply 'builtins.attrNames'
+//
+// and parses the JSON array of attribute names defensively: any failure
+// (missing nix, non-zero exit, corrupt/unexpected JSON) returns ok = false.
+// No timeout in v1 — accepted inline blocking, debounced by the byte-equal
+// write skip. The returned map owns cloned name strings.
+run_nix_eval :: proc(ov: core.Overlay_Entry) -> (map[string]bool, bool) {
+	attr_ref := fmt.tprintf("%s#%s", ov.url, ov.attr_path)
+	desc := os.Process_Desc {
+		command = []string{"nix", "eval", "--json", attr_ref, "--apply", "builtins.attrNames"},
+	}
+	_, stdout_bytes, _, err := os.process_exec(desc, context.allocator)
+	defer delete(stdout_bytes)
+	if err != nil {
+		return nil, false
+	}
+
+	v, jerr := json.parse(string(stdout_bytes))
+	if jerr != nil {
+		return nil, false
+	}
+	defer json.destroy_value(v)
+
+	arr, is_arr := v.(json.Array)
+	if !is_arr {
+		return nil, false
+	}
+	names := make(map[string]bool)
+	for e in arr {
+		#partial switch s in e {
+		case json.String:
+			// Clone: the parsed value (and its strings) is destroyed below.
+			names[strings.clone(s)] = true
+		}
+	}
+	return names, true
 }
 
 // local_repos returns the first-level subfolders of path that look like local

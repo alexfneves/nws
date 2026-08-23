@@ -47,6 +47,10 @@ Daemon_State :: struct {
 	inotify_fd:  linux.Fd,
 	listen_sock: net.TCP_Socket,
 	ws:          [dynamic]Workspace,
+	// ws_cfgs holds the full per-workspace backend settings (overlay entries,
+	// nixpkgs URL) keyed by canonical workspace path. Only overlay workspaces
+	// are present today; flake workspaces round-trip as the legacy string form.
+	ws_cfgs:     map[string]core.Workspace_Config,
 	clients:     [dynamic]Client,
 	config_path: string,
 	port:        int,
@@ -330,6 +334,7 @@ run_service :: proc(config_path_override: string = "") {
 	log_line(logging, "daemon starting on 127.0.0.1:%d", cfg.port)
 
 	state := Daemon_State{}
+	state.ws_cfgs = make(map[string]core.Workspace_Config)
 	state.config_path = cfg_path
 	state.port = cfg.port
 	state.logging = logging
@@ -360,6 +365,14 @@ run_service :: proc(config_path_override: string = "") {
 	}
 	state.listen_sock = sock
 	log_line(logging, "listening on 127.0.0.1:%d", cfg.port)
+
+	// Keep overlay workspaces' backend settings so save_state_config can
+	// round-trip them instead of degrading to the legacy string form.
+	for ws in cfg.workspaces {
+		if ws.kind == .overlay {
+			state.ws_cfgs[ws.name] = core.clone_workspace_config(ws)
+		}
+	}
 
 	// Re-establish all configured workspaces (initial sync materialises an
 	// already-present clone immediately, without waiting for an event).
@@ -579,6 +592,7 @@ remove_workspace :: proc(state: ^Daemon_State, path: string) -> bool {
 	for ws, i in state.ws {
 		if ws.path == path {
 			linux.inotify_rm_watch(state.inotify_fd, ws.wd)
+			forget_workspace_config(state, path)
 			log_line(state.logging, "removed workspace %q (wd %d)", ws.path, ws.wd)
 			delete(ws.path)
 			unordered_remove(&state.ws, i)
@@ -613,11 +627,21 @@ drop_workspace_wd :: proc(state: ^Daemon_State, wd: linux.Wd) {
 	for ws, i in state.ws {
 		if ws.wd == wd {
 			linux.inotify_rm_watch(state.inotify_fd, wd)
+			forget_workspace_config(state, ws.path)
 			delete(ws.path)
 			unordered_remove(&state.ws, i)
 			save_state_config(state)
 			return
 		}
+	}
+}
+
+// forget_workspace_config frees and removes any stored backend settings for a
+// path. Missing paths are a no-op (flake workspaces have none).
+forget_workspace_config :: proc(state: ^Daemon_State, path: string) {
+	if cfg, ok := state.ws_cfgs[path]; ok {
+		core.delete_workspace_config(cfg)
+		delete_key(&state.ws_cfgs, path)
 	}
 }
 
@@ -628,9 +652,14 @@ save_state_config :: proc(state: ^Daemon_State) {
 	cfg.workspaces = make([dynamic]core.Workspace_Config, context.allocator)
 	defer core.delete_workspaces(&cfg)
 	for ws in state.ws {
-		// Later overlay plumbing carries full Workspace_Config through
-		// Daemon_State; for now every workspace round-trips as legacy flake.
-		append(&cfg.workspaces, core.Workspace_Config{name = strings.clone(ws.path)})
+		if saved, ok := state.ws_cfgs[ws.path]; ok {
+			// Overlay (and other non-default) backends: persist the full
+			// object form so backend settings survive the register→config
+			// round-trip.
+			append(&cfg.workspaces, core.clone_workspace_config(saved))
+		} else {
+			append(&cfg.workspaces, core.Workspace_Config{name = strings.clone(ws.path)})
+		}
 	}
 	core.save_config(state.config_path, cfg)
 }

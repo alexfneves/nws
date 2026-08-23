@@ -285,3 +285,93 @@ test_url_decode_malformed :: proc(t: ^testing.T) {
 	_, ok = core.decode("a%zz") // invalid hex
 	testing.expectf(t, !ok, "invalid hex should fail")
 }
+
+// clone_workspace_config deep-copies settings; the clone serializes to the
+// same bytes and compares equal by value.
+@(test)
+test_workspace_config_clone_roundtrip :: proc(t: ^testing.T) {
+	orig := core.Workspace_Config {
+		name        = strings.clone("/ws/overlay"),
+		kind        = .overlay,
+		nixpkgs_url = strings.clone("github:NixOS/nixpkgs/nixos-24.11"),
+	}
+	orig.overlays = make([dynamic]core.Overlay_Entry)
+	defer core.delete_workspace_config(orig)
+	append(
+		&orig.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:lopsided98/nix-ros-overlay/master"),
+			attr_path = strings.clone("rosPackages.humble"),
+			overlay_attr = "",
+			is_flake = true,
+		},
+	)
+	append(
+		&orig.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("https://example.com/overlay.tar.gz"),
+			attr_path = strings.clone("pkgs"),
+			overlay_attr = strings.clone("custom"),
+			is_flake = false,
+		},
+	)
+
+	clone := core.clone_workspace_config(orig)
+	defer core.delete_workspace_config(clone)
+
+	testing.expectf(
+		t,
+		core.workspace_configs_equal(orig, clone),
+		"clone should compare equal to the original",
+	)
+
+	cfg_a := core.Config {
+		port = core.DEFAULT_PORT,
+	}
+	cfg_a.workspaces = make([dynamic]core.Workspace_Config)
+	defer core.delete_workspaces(&cfg_a)
+	append(&cfg_a.workspaces, core.clone_workspace_config(orig))
+
+	cfg_b := core.Config {
+		port = core.DEFAULT_PORT,
+	}
+	cfg_b.workspaces = make([dynamic]core.Workspace_Config)
+	defer core.delete_workspaces(&cfg_b)
+	append(&cfg_b.workspaces, core.clone_workspace_config(clone))
+
+	text_a := core.build_config_json(cfg_a)
+	defer delete(text_a)
+	text_b := core.build_config_json(cfg_b)
+	defer delete(text_b)
+	testing.expectf(
+		t,
+		text_a == text_b,
+		"clone should serialize identically:\na=%s\nb=%s",
+		text_a,
+		text_b,
+	)
+
+	// Sanity: unequal configs must not compare equal.
+	clone.kind = .flake
+	testing.expectf(
+		t,
+		!core.workspace_configs_equal(orig, clone),
+		"differing kinds must not compare equal",
+	)
+}
+
+// A flake workspace clones as a plain deep copy (no overlays) and stays in
+// legacy string form when serialized.
+@(test)
+test_workspace_config_clone_flake :: proc(t: ^testing.T) {
+	orig := core.Workspace_Config {
+		name = "/plain/ws",
+	}
+	clone := core.clone_workspace_config(orig)
+	defer core.delete_workspace_config(clone)
+	testing.expectf(
+		t,
+		core.workspace_configs_equal(orig, clone),
+		"flake clone should equal original",
+	)
+}

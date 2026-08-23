@@ -302,6 +302,35 @@ write_workspace_object :: proc(
 	strings.write_string(b, "  }")
 }
 
+// clone_workspace_config deep-copies one Workspace_Config (name, overlay
+// entries, nixpkgs URL) into freshly allocated strings owned by the caller.
+// Free the result with delete_workspace_config.
+clone_workspace_config :: proc(
+	ws: Workspace_Config,
+	allocator := context.allocator,
+) -> Workspace_Config {
+	out := Workspace_Config {
+		kind        = ws.kind,
+		nixpkgs_url = ws.nixpkgs_url != "" ? strings.clone(ws.nixpkgs_url, allocator) : "",
+	}
+	out.name = strings.clone(ws.name, allocator)
+	if len(ws.overlays) > 0 {
+		out.overlays = make([dynamic]Overlay_Entry, 0, len(ws.overlays), allocator)
+		for ov in ws.overlays {
+			append(
+				&out.overlays,
+				Overlay_Entry {
+					url = strings.clone(ov.url, allocator),
+					attr_path = strings.clone(ov.attr_path, allocator),
+					overlay_attr = ov.overlay_attr != "" ? strings.clone(ov.overlay_attr, allocator) : "",
+					is_flake = ov.is_flake,
+				},
+			)
+		}
+	}
+	return out
+}
+
 // delete_workspaces frees every workspace (names, overlay entries, URLs) and
 // the backing array.
 delete_workspaces :: proc(cfg: ^Config) {
@@ -327,6 +356,27 @@ delete_workspace_config :: proc(ws: Workspace_Config) {
 	if len(ws.nixpkgs_url) > 0 {
 		delete(ws.nixpkgs_url)
 	}
+}
+
+// workspace_configs_equal reports whether two Workspace_Configs carry the same
+// settings (by value; order-sensitive for overlays).
+workspace_configs_equal :: proc(a, b: Workspace_Config) -> bool {
+	if a.name != b.name || a.kind != b.kind || a.nixpkgs_url != b.nixpkgs_url {
+		return false
+	}
+	if len(a.overlays) != len(b.overlays) {
+		return false
+	}
+	for i in 0 ..< len(a.overlays) {
+		x, y := a.overlays[i], b.overlays[i]
+		if x.url != y.url ||
+		   x.attr_path != y.attr_path ||
+		   x.overlay_attr != y.overlay_attr ||
+		   x.is_flake != y.is_flake {
+			return false
+		}
+	}
+	return true
 }
 
 // json_escape escapes backslashes and double quotes for safe inclusion inside

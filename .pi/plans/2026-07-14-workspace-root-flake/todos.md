@@ -38,7 +38,7 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Tests: normal config, worktree-style `.git` file (returns none), missing file, multiple remotes (origin wins).
 - Acceptance: ISC-9.
 
-## T4: Rewrite `sync_workspace` to generate-and-write root flake
+## T4: Rewrite `sync_workspace` to generate-and-write root flake — DONE (commit e6c9ebc)
 - Files: `src/nix_workspace.odin` (modify `sync_workspace` ~line 711)
 - New flow: `local_repos(path)` → for each child: `git_remote` (if clone present) else `state.json` lookup → upsert state → `generate_root_flake` → if root flake absent or `is_managed_root`, atomic-write when changed; else log skip.
 - Reference for atomic write + changed-flag: existing `sync_workspace` body and `core.sync_flake` call site (`src/nix_workspace.odin:711-746`).

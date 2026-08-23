@@ -763,6 +763,12 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 			if c.has_url {
 				delete(c.url)
 			}
+			for d in c.deps {
+				delete(d)
+			}
+			if len(c.deps) > 0 {
+				delete(c.deps)
+			}
 		}
 		delete(children)
 	}
@@ -777,6 +783,18 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		// the temporary allocator and must never be freed manually.
 		child_dir := strings.concatenate({path, "/", name}, context.allocator)
 		url, ok := core.read_origin_url(child_dir)
+
+		// While the clone is present, parse its flake.nix input names so the
+		// generator can wire sibling dependencies locally. Absent clones keep
+		// no deps (their GitHub URL needs no local wiring).
+		if ok {
+			child_flake := strings.concatenate({child_dir, "/flake.nix"}, context.allocator)
+			if text, rerr := os.read_entire_file(child_flake, context.allocator); rerr == nil {
+				child.deps = core.parse_flake_input_names(string(text))
+				delete(text)
+			}
+			delete(child_flake)
+		}
 		delete(child_dir)
 
 		if ok {

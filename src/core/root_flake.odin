@@ -11,6 +11,11 @@ Child_Info :: struct {
 	name:    string,
 	url:     string,
 	has_url: bool,
+	// Names of flake inputs this child declares (parsed from its own
+	// flake.nix while the clone is present). When one of these matches a
+	// sibling child, the generator emits an override so the sibling resolves
+	// locally: `<child>.inputs.<dep>.url = "path:./<dep>"`. May be nil.
+	deps:    []string,
 }
 
 // MANAGED_ROOT_HEADER is the first line that marks a root flake.nix as
@@ -50,15 +55,7 @@ generate_root_flake :: proc(children: []Child_Info, allocator := context.allocat
 		strings.write_string(&b, "  inputs = {\n")
 		for c in sorted {
 			strings.write_string(&b, "    ")
-			if is_nix_identifier(c.name) {
-				strings.write_string(&b, c.name)
-			} else {
-				// Not a bare identifier: emit as a quoted attrset key so the
-				// generated flake stays syntactically valid.
-				strings.write_string(&b, "\"")
-				nix_escape_string(&b, c.name)
-				strings.write_string(&b, "\"")
-			}
+			write_attr_key(&b, c.name)
 			strings.write_string(&b, `.url = "path:./`)
 			nix_escape_string(&b, c.name)
 			strings.write_string(&b, `";`)
@@ -69,6 +66,7 @@ generate_root_flake :: proc(children: []Child_Info, allocator := context.allocat
 				strings.write_string(&b, c.url)
 			}
 			strings.write_string(&b, "\n")
+			emit_sibling_overrides(&b, c, sorted[:])
 		}
 		strings.write_string(&b, "  };\n")
 	} else {
@@ -163,6 +161,190 @@ nix_escape_string :: proc(b: ^strings.Builder, s: string) {
 			i += 1
 		}
 	}
+}
+
+// write_attr_key writes name as an attrset key: bare when it is a valid Nix
+// identifier, quoted+escaped otherwise.
+write_attr_key :: proc(b: ^strings.Builder, name: string) {
+	if is_nix_identifier(name) {
+		strings.write_string(b, name)
+	} else {
+		strings.write_string(b, "\"")
+		nix_escape_string(b, name)
+		strings.write_string(b, "\"")
+	}
+}
+
+// has_child_name reports whether any child in sorted has the given name.
+has_child_name :: proc(sorted: []Child_Info, name: string) -> bool {
+	for c in sorted {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// emit_sibling_overrides writes `<child>.inputs.<dep>.url = "path:./<dep>"`
+// lines for every dependency of child whose name matches another workspace
+// child, in sorted dep order (allocation-free selection over deps). Self-
+// references and deps that are not siblings are skipped.
+emit_sibling_overrides :: proc(b: ^strings.Builder, c: Child_Info, sorted: []Child_Info) {
+	last := ""
+	for _round := 0; _round < len(c.deps); _round += 1 {
+		best := -1
+		for d, i in c.deps {
+			if d == c.name || !has_child_name(sorted, d) {
+				continue
+			}
+			if last != "" && d <= last {
+				continue // already emitted (deps are duplicate-free)
+			}
+			if best == -1 || d < c.deps[best] {
+				best = i
+			}
+		}
+		if best == -1 {
+			break
+		}
+		last = c.deps[best]
+		strings.write_string(b, "    ")
+		write_attr_key(b, c.name)
+		strings.write_string(b, `.inputs.`)
+		write_attr_key(b, last)
+		strings.write_string(b, `.url = "path:./`)
+		nix_escape_string(b, last)
+		strings.write_string(b, `";`)
+		strings.write_string(b, "\n")
+	}
+}
+
+// parse_flake_input_names extracts the top-level input attribute names
+// declared in a child flake.nix text. Conservative line-based parser:
+//   NAME.url = ...;   captures NAME
+//   NAME = { ... };   captures NAME (attrset form)
+// Everything else (follows lines, nested inner keys like those inside
+// `pyproject-build-systems = { inputs = {...} }`, comments, outputs) is
+// ignored. Duplicates removed; order follows the file. The returned slice
+// and its strings are allocated from the allocator and owned by the caller.
+parse_flake_input_names :: proc(text: string, allocator := context.allocator) -> []string {
+	names := make([dynamic]string, 0, 8, allocator)
+
+	lines := strings.split(text, "\n")
+	defer delete(lines)
+	// Only lines inside the top-level `inputs = { ... }` block are
+	// considered; a naive brace counter tracks nesting so we leave the block
+	// when it closes (conservative: braces inside string literals can confuse
+	// it, in which case we simply stop capturing — fail-open).
+	in_inputs := false
+	depth := 0
+	for line in lines {
+		t := strings.trim_space(line)
+		if len(t) == 0 || t[0] == '#' {
+			continue
+		}
+		if !in_inputs {
+			if t == "inputs" ||
+			   strings.has_prefix(t, "inputs ") ||
+			   strings.has_prefix(t, "inputs=") {
+				rest := strings.trim_space(t[len("inputs"):])
+				if strings.has_prefix(rest, "=") && strings.contains(rest, "{") {
+					in_inputs = true
+					depth = count_braces(t)
+				}
+			}
+			continue
+		}
+		depth += count_braces(t)
+		if depth <= 0 {
+			in_inputs = false
+			continue
+		}
+		name, ok := parse_input_line_head(t)
+		if !ok || name == "inputs" {
+			continue
+		}
+		dup := false
+		for existing in names {
+			if existing == name {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		append(&names, strings.clone(name, allocator))
+	}
+	return names[:]
+}
+
+// count_braces counts '{' minus '}' occurrences in s.
+count_braces :: proc(s: string) -> int {
+	n := 0
+	for c in s {
+		if c == '{' {
+			n += 1
+		} else if c == '}' {
+			n -= 1
+		}
+	}
+	return n
+}
+
+// parse_input_line_head recognises the two input declaration shapes at the
+// head of a trimmed line:
+//
+//	NAME.url = ...
+//	NAME = { ...
+//
+// returning the name; ok=false otherwise.
+parse_input_line_head :: proc(t: string) -> (name: string, ok: bool) {
+	i := 0
+	if i >= len(t) || !ident_start_byte(t[i]) {
+		return
+	}
+	start := i
+	for i < len(t) && ident_cont_byte(t[i]) {
+		i += 1
+	}
+	name = t[start:i]
+	j := i
+	for j < len(t) && (t[j] == ' ' || t[j] == '\t') {
+		j += 1
+	}
+	if j < len(t) && t[j] == '.' {
+		// NAME.url = ...
+		if strings.has_prefix(t[j:], ".url") {
+			k := j + 4
+			for k < len(t) && (t[k] == ' ' || t[k] == '\t') {
+				k += 1
+			}
+			if k < len(t) && t[k] == '=' {
+				return name, true
+			}
+		}
+		return
+	}
+	if j < len(t) && t[j] == '=' {
+		// NAME = { ...  (attrset form)
+		k := j + 1
+		for k < len(t) && (t[k] == ' ' || t[k] == '\t') {
+			k += 1
+		}
+		if k < len(t) && t[k] == '{' {
+			return name, true
+		}
+	}
+	return
+}
+
+ident_start_byte :: proc(c: byte) -> bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+ident_cont_byte :: proc(c: byte) -> bool {
+	return ident_start_byte(c) || (c >= '0' && c <= '9') || c == '\'' || c == '-'
 }
 
 // is_managed_root reports whether the given flake text starts with the

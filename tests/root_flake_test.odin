@@ -300,3 +300,66 @@ test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
 		want,
 	)
 }
+
+@(test)
+test_root_flake_sibling_overrides :: proc(t: ^testing.T) {
+	children := []core.Child_Info {
+		{name = "app-b", deps = []string{"lib-a", "nixpkgs", "missing"}},
+		{name = "lib-a"},
+	}
+	got := core.generate_root_flake(children)
+	defer delete(got)
+
+	testing.expectf(
+		t,
+		strings.contains(got, `app-b.inputs.lib-a.url = "path:./lib-a";`),
+		"expected sibling override for lib-a, got:\n%s",
+		got,
+	)
+	// Non-sibling deps must not be wired.
+	testing.expect(t, !strings.contains(got, "inputs.nixpkgs.url"))
+	testing.expect(t, !strings.contains(got, "inputs.missing.url"))
+}
+
+@(test)
+test_parse_flake_input_names :: proc(t: ^testing.T) {
+	text := `
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    pyproject-build-systems = {
+      url = "x";
+      inputs = {
+        pyproject-nix.follows = "pyproject-nix";
+      };
+    };
+  };
+  outputs = { self, nixpkgs }: {};
+}
+`
+	got := core.parse_flake_input_names(text)
+	defer {
+		for g in got {
+			delete(g)
+		}
+		delete(got)
+	}
+	expect_sorted_names :: proc(t: ^testing.T, got: []string, want: []string) {
+		testing.expectf(t, len(got) == len(want), "got %v, want %v", got, want)
+		for g, i in got {
+			testing.expectf(t, i < len(want) && g == want[i], "got %v, want %v", got, want)
+		}
+	}
+	expect_sorted_names(
+		t,
+		got,
+		[]string{"nixpkgs", "flake-parts", "pyproject-nix", "pyproject-build-systems"},
+	)
+}

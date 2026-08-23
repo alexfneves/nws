@@ -4,7 +4,7 @@ Instructions for any agent (or human) working in the `nws` repository. Read this
 
 ## What this is
 
-`nws` is a single Odin CLI binary that, in daemon mode (`nws service`), watches a set of Nix **workspace** folders and rewrites each one's `flake.nix` so that cloned repos are pinned to `path:./<name>` and uncloned ones keep (or return to) their GitHub URL. It also exposes a tiny localhost TCP control socket that the `register` / `unregister` / `list` client commands talk to.
+`nws` is a single Odin CLI binary that, in daemon mode (`nws service`), watches a set of Nix **workspace** folders and manages a generated `flake.nix` at each workspace root: cloned child repos are pinned via `path:./<name>` inputs (canonical GitHub URLs kept as `# nws:` markers and persisted in state), uncloned ones fall back to their GitHub URL, and the children's outputs are aggregated namespaced. Child flakes themselves are never modified. It also exposes a tiny localhost TCP control socket that the `register` / `unregister` / `list` client commands talk to.
 
 See the current implementation plan (when present) under `.pi/plans/YYYY-MM-DD-<name>/plan.md`.
 
@@ -47,7 +47,8 @@ devenv shell       # enter the dev shell
 - No `core:net/http` — the control protocol is raw newline-delimited TCP over `127.0.0.1:<port>`. Client paths are percent-encoded so spaces/`%` survive the wire.
 - Sockets must be non-blocking (`net.set_blocking(sock, false)`) before they go into `poll()`; buffer client reads per-fd until a `\n`.
 - inotify events are variable-length: parse the read buffer in a loop advancing by `size_of(Inotify_Event) + len`.
-- The `# nws: <canonical>` marker in a flake input line must never be duplicated on repeat rewrites; the transform is conservative/fail-open (never corrupt the flake).
+- The generated root flake starts with the `# nws-generated — do not edit` header; a root flake without it is user-authored and never touched. Regeneration is deterministic and atomic (tmp+rename); writing identical bytes is skipped.
+- Child flakes are off-limits: nws never reads or writes them. Canonical URLs come from `<child>/.git/config` (`[remote "origin"]`) while cloned, else from `~/.config/nws/state.json`. Old inline `# nws:` markers in child flakes from the previous scheme are inert comments.
 - Formatting: use `odinfmt`; the repo has a pre-commit `odin-fmt` git hook. Run `nix develop --command odinfmt src/nix_workspace.odin` if needed.
 - Config lives at `~/.config/nws/config.json`; write it atomically (temp file + rename).
 

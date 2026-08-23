@@ -50,7 +50,7 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Keep only helpers still referenced (marker extraction). Ensure `odin build src/nix_workspace.odin -file -collection:nwscore=src` still compiles.
 - Acceptance: `nix build .#main` and `devenv test` pass; no references to removed procs.
 
-## T6: README + manual verification checklist
+## T6: README + manual verification checklist — DONE ✅ (commit 8549764)
 - Files: `README.md`, plan's manual checklist
 - Document: root-flake model, "workflows move to workspace root / --override-input", old inline child markers are inert, state file location `~/.config/nws/state.json`, managed-header warning.
 - Acceptance: `nix build .#main` + manual smoke: `result/bin/nws service` in a temp workspace with two child repos → root flake generated, children unmodified, `LIST` socket works.

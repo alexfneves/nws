@@ -794,6 +794,35 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		append(&children, child)
 	}
 
+	// Children recorded in state but whose clone is currently absent: emit
+	// them pinned at their persisted canonical URL so a removed repo restores
+	// to its GitHub URL instead of silently vanishing from the root flake.
+	if repos, has_ws := st.workspaces[path]; has_ws {
+		for name, url in repos {
+			found := false
+			for c in children {
+				if c.name == name {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			append(
+				&children,
+				core.Child_Info {
+					// `name` borrows the state map key (state outlives these
+					// children); `url` is cloned because the children cleanup
+					// deletes it.
+					name    = name,
+					url     = strings.clone(url),
+					has_url = true,
+				},
+			)
+		}
+	}
+
 	defer {
 		if state_dirty {
 			if !core.save_state(sp, &st) {

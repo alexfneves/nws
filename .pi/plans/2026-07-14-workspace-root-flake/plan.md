@@ -100,3 +100,31 @@ None new (Odin stdlib only: `core:strings`, `core:fmt`, `core:os`, `core:encodin
 - **State file drift** (user moves workspaces): state keyed by absolute workspace path; stale entries pruned opportunistically during save.
 - **Aggregated outputs need children evaluated by Nix** — children with broken eval will break root eval; accepted tradeoff (documented), since delegation is the point.
 - Open question parked: whether checks aggregation should be opt-in to avoid slow CI-by-default (default: include; revisit if noisy).
+
+## Manual Verification Checklist (T6)
+
+Smoke test after any change affecting behaviour:
+
+1. `nix build .#main` — binary builds.
+2. `devenv test` — unit tests pass (`odin test tests -collection:nwscore=src`).
+3. Manual daemon smoke test:
+   ```bash
+   mkdir -p /tmp/nws-smoke/{repo-a,repo-b}
+   git -C /tmp/nws-smoke/repo-a init
+   git -C /tmp/nws-smoke/repo-b init && \
+     git -C /tmp/nws-smoke/repo-b remote add origin https://github.com/me/repo-b.git
+   echo '{ outputs = _: {}; }' > /tmp/nws-smoke/repo-a/flake.nix   # child flakes, never touched
+   echo '{ outputs = _: {}; }' > /tmp/nws-smoke/repo-b/flake.nix
+   NWS_CONFIG_PATH=/tmp/nws-smoke-config/config.json result/bin/nws service &
+   nws register /tmp/nws-smoke
+   printf 'LIST\n' | nc 127.0.0.1 17424        # socket works, lists the workspace
+   ```
+4. Verify:
+   - `/tmp/nws-smoke/flake.nix` exists and starts with `# nws-generated — do not edit`.
+   - `repo-a` input is `path:./repo-a` with **no** marker (no origin); `repo-b`
+     input has `# nws: https://github.com/me/repo-b.git`.
+   - Children's flakes are byte-for-byte unmodified.
+   - State persisted at `<config dir>/state.json` with repo-b's URL; delete
+     `/tmp/nws-smoke/repo-b`, touch an event → input restores to the GitHub URL.
+
+Status: ✅ verified (see T6 completion commit for evidence).

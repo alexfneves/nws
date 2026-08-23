@@ -3,13 +3,16 @@
 `nws` is a single Odin CLI binary that keeps Nix workspace folders in sync with
 the state of the repos cloned inside them.
 
-A **daemon** (`nws service`) watches a set of Nix workspace folders and rewrites
-each one's `flake.nix` so that:
+A **daemon** (`nws service`) watches a set of Nix workspace folders and manages a
+generated **root `flake.nix`** at the top of each workspace so that:
 
-- a repo subfolder that is currently **cloned** (has a `.git` or its own
-  `flake.nix`) is pinned to `path:./<name>`, and
-- a repo subfolder that is **not** cloned keeps (or returns to) its original
-  GitHub URL.
+- every first-level subdirectory is declared as an input. A subfolder that is
+  currently **cloned** (has its own `.git`) is pinned to `path:./<name>`, and
+- a subfolder whose clone was **removed** falls back to the canonical GitHub URL
+  recorded for it.
+
+The daemon **never modifies the child repos' own flakes** — only the generated
+root flake at the workspace root.
 
 Repos are watched via pure-Odin inotify (no busy loops), and a tiny TCP control
 socket lets the `register` / `unregister` / `list` client commands talk to the
@@ -77,7 +80,7 @@ nws help                show this help
 
 `register` / `unregister` / `list` are client commands: they connect to the
 daemon's control socket and ask the daemon to do the work, so the daemon must be
-running first. Daemon logs (watch add/remove, flake rewrites, connection
+running first. Daemon logs (watch add/remove, root-flake regeneration, connection
 handling) go to stderr; set `NWS_LOG=0` to silence them.
 
 ```bash
@@ -142,34 +145,73 @@ created on demand, and `register`/`unregister` update it automatically. The
 daemon re-establishes all watches from the config on startup, so state survives
 reboots.
 
-## How the flake rewrite works
+## How the root flake works
 
-For each workspace `W`, `nws` reads `W/flake.nix` and inspects each input line of
-the form `NAME.url = "VALUE";`:
+For each workspace `W`, the daemon generates and manages a single
+`W/flake.nix`, starting with the header:
 
-1. If subfolder `NAME` inside `W` is a **local repo** (has `.git` or
-   `flake.nix`), the line is rewritten to `path:./NAME`. The original GitHub URL
-   is remembered by writing a marker comment:
+```
+# nws-generated — do not edit
+```
 
-   ```nix
-   inputs = {
-     repo-a.url = "path:./repo-a";   # nws: github:my-org/repo-a
-     repo-b.url = "github:my-org/repo-b";
-   };
-   ```
+### What the generated flake looks like
 
-2. If the subfolder's clone is later **removed**, the line is restored to the
-   canonical URL recorded in the `# nws: <canonical>` marker.
+Each first-level subdirectory becomes one input, plus an outputs section that
+aggregates the children's `packages`, `devShells`, `apps` and `checks` under
+namespaced `<child>-` prefixed names (so `.default` collisions are impossible
+by construction):
 
-The marker is never duplicated on repeated rewrites. The transform is
-deliberately **conservative and fail-open**: lines it cannot confidently parse
-(multi-line strings, comments, nested `.url.foo` attributes, unusual formatting)
-are passed through unchanged rather than risk corrupting the flake. Writes are
-atomic, so a clone-in-progress burst never leaves a half-written file and the
-result is idempotent.
+```nix
+# nws-generated — do not edit
+{
+  inputs = {
+    repo-a.url = "path:./repo-a"; # nws: github:my-org/repo-a
+    repo-b.url = "github:my-org/repo-b";
+  };
+  # outputs delegate each child's packages/devShells/apps/checks
+  # under <child>-<attr> names ...
+}
+```
 
-The canonical URL lives in the flake itself, which is what keeps
-`config.json` minimal (just a path list).
+- Cloned children get `path:./<name>` inputs; the original canonical URL is
+  kept in the `# nws: <url>` comment on the same line (emitted exactly once,
+  since the flake is regenerated from scratch rather than edited in place).
+- Children whose clone is absent fall back to their canonical GitHub URL.
+- A child with no discoverable canonical URL simply stays `path:`-pinned with
+  no marker (fail-open).
+- Children are always emitted in sorted order, so regeneration is
+  byte-idempotent; writing identical bytes is skipped (no self-trigger loop).
+  Writes are atomic (temp file + rename).
+
+### Where the canonical URL comes from
+
+While a child is cloned, its canonical URL is read from its own
+`.git/config` (`[remote "origin"] url = ...`). Every URL observed this way is
+persisted to `~/.config/nws/state.json` (or `state.json` in the directory of
+the `--config-path` file), keyed by workspace path and repo name. When a clone
+is later removed, the persisted URL is used, so the input restores to the
+GitHub URL instead of dangling on a missing path.
+
+### Behavior notes
+
+- **User-authored root flakes are never touched.** If `W/flake.nix` exists but
+  does not start with the `# nws-generated` header, nws logs and leaves it
+  alone.
+- **Deleting the generated root flake is safe:** it is regenerated on the next
+  watch event. Likewise any edit to a managed root flake is overwritten on the
+  next event — hence the *do not edit* warning.
+- **Child repos keep their own flakes pristine**, still pointing at GitHub.
+  Workflows therefore move to the workspace root: run `nix build` /
+  `nix develop` there, or use
+  `nix develop --override-input <child> ./<child>` when you want to work
+  against a single child directly.
+
+### Migration from the old scheme
+
+Older nws versions rewrote child flakes in place and left inline
+`# nws: ...` markers behind. Those markers are now **inert comments**; nws no
+longer reads or writes child flakes, and you can delete the stale markers at
+your leisure.
 
 ## Control wire protocol
 
@@ -182,8 +224,8 @@ workspace paths round-trip safely.
 
 ## Running the tests
 
-Tests are Odin unit tests in `tests/` (flake-rewrite and config round-trip),
-run through the devenv test entrypoint:
+Tests are Odin unit tests in `tests/` (root-flake generation, state and git
+remote resolution, config round-trip), run through the devenv test entrypoint:
 
 ```bash
 devenv test
@@ -198,8 +240,8 @@ the `nwscore` collection) so it can be unit-tested without pulling in the
 
 - `src/nix_workspace.odin` — the `package main` binary (CLI dispatch, daemon
   event loop).
-- `src/core/` — importable core logic: flake transform, config parse/save,
-  URL encode/decode.
+- `src/core/` — importable core logic: root-flake generator, git remote
+  parsing, persisted state, config parse/save, URL encode/decode.
 - `tests/` — unit tests for the core logic.
 - `flake.nix` — devenv flake: binary + systemd unit derivations, devenv
   process, dev shell and test hook.

@@ -68,7 +68,7 @@ devenv up
 ## CLI usage
 
 ```
-nws service             run the daemon (watches workspaces, serves the control socket)
+nws service [--config-path PATH]  run the daemon (watches workspaces, serves the control socket)
 nws register [PATH]     add a workspace (default: current directory)
 nws unregister [PATH]   remove a workspace
 nws list                list registered workspaces
@@ -81,7 +81,8 @@ running first. Daemon logs (watch add/remove, flake rewrites, connection
 handling) go to stderr; set `NWS_LOG=0` to silence them.
 
 ```bash
-nws service &                    # start the daemon
+nws service [--config-path PATH] &  # start the daemon with optional config file
+nws service &                    # start the daemon with default config
 nws register ~/projects/mytree   # start watching a workspace
 nws list                         # see registered workspaces
 nws unregister ~/projects/mytree # stop watching it
@@ -119,7 +120,7 @@ What completes:
 
 ## Configuration
 
-The daemon reads `~/.config/nws/config.json` on startup. If the file is missing
+The daemon reads `~/.config/nws/config.json` on startup, or the path given with `--config-path`. If the file is missing
 or corrupt, the daemon falls back to defaults instead of crashing.
 
 ```json

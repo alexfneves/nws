@@ -84,7 +84,15 @@ main :: proc() {
 
 	switch args[0] {
 	case "service":
-		run_service()
+		config_path_override := ""
+		for i := 1; i < len(args); i += 1 {
+			if strings.has_prefix(args[i], "--config-path=") {
+				config_path_override = args[i][len("--config-path="):]
+			} else if args[i] == "--config-path" && i + 1 < len(args) {
+				config_path_override = args[i + 1]
+			}
+		}
+		run_service(config_path_override)
 	case "register":
 		arg := ""
 		if len(args) > 1 {
@@ -112,7 +120,7 @@ print_usage :: proc() {
 	fmt.println()
 	fmt.println("Usage:")
 	fmt.println(
-		"  nws service             run the daemon (watches workspaces, serves the control socket)",
+		"  nws service [--config-path PATH]  run the daemon (watches workspaces, serves the control socket)",
 	)
 	fmt.println("  nws register [PATH]     add a workspace (default: current directory)")
 	fmt.println("  nws unregister [PATH]   remove a workspace")
@@ -313,9 +321,12 @@ log_line :: proc(logging: bool, f: string, args: ..any) {
 	fmt.eprintf("\n")
 }
 
-run_service :: proc() {
+run_service :: proc(config_path_override: string = "") {
 	logging := should_log()
-	cfg_path := config_path()
+	cfg_path := config_path_override
+	if cfg_path == "" {
+		cfg_path = config_path()
+	}
 	if len(cfg_path) == 0 {
 		fmt.eprintln("nws: cannot determine home directory for config")
 		return

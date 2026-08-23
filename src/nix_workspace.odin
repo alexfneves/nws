@@ -179,12 +179,7 @@ resolve_path :: proc(arg: string) -> string {
 
 client_port :: proc() -> int {
 	cfg, _ := core.load_config(config_path())
-	defer {
-		for w in cfg.workspaces {
-			delete(w)
-		}
-		delete(cfg.workspaces)
-	}
+	defer core.delete_workspaces(&cfg)
 	return cfg.port
 }
 
@@ -369,21 +364,18 @@ run_service :: proc(config_path_override: string = "") {
 	// Re-establish all configured workspaces (initial sync materialises an
 	// already-present clone immediately, without waiting for an event).
 	for ws in cfg.workspaces {
-		#partial switch add_workspace(&state, ws) {
+		#partial switch add_workspace(&state, ws.name) {
 		case .Not_Dir:
 			log_line(
 				logging,
 				"warning: configured workspace %q is not a directory — skipping",
-				ws,
+				ws.name,
 			)
 		case .Watch_Failed:
-			log_line(logging, "warning: cannot watch %q — skipping", ws)
+			log_line(logging, "warning: cannot watch %q — skipping", ws.name)
 		}
 	}
-	for w in cfg.workspaces {
-		delete(w)
-	}
-	delete(cfg.workspaces)
+	core.delete_workspaces(&cfg)
 	log_line(logging, "%d workspace(s) loaded", len(state.ws))
 
 	// Main event loop: inotify fd, listen fd, then one poll entry per client.
@@ -633,10 +625,12 @@ save_state_config :: proc(state: ^Daemon_State) {
 	cfg := core.Config {
 		port = state.port,
 	}
-	cfg.workspaces = make([dynamic]string, context.allocator)
-	defer delete(cfg.workspaces)
+	cfg.workspaces = make([dynamic]core.Workspace_Config, context.allocator)
+	defer core.delete_workspaces(&cfg)
 	for ws in state.ws {
-		append(&cfg.workspaces, ws.path)
+		// Later overlay plumbing carries full Workspace_Config through
+		// Daemon_State; for now every workspace round-trips as legacy flake.
+		append(&cfg.workspaces, core.Workspace_Config{name = strings.clone(ws.path)})
 	}
 	core.save_config(state.config_path, cfg)
 }

@@ -54,3 +54,10 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Files: `README.md`, plan's manual checklist
 - Document: root-flake model, "workflows move to workspace root / --override-input", old inline child markers are inert, state file location `~/.config/nws/state.json`, managed-header warning.
 - Acceptance: `nix build .#main` + manual smoke: `result/bin/nws service` in a temp workspace with two child repos → root flake generated, children unmodified, `LIST` socket works.
+
+## Review fixes (2026-08-23, per review.md) — DONE
+- [P2] `src/core/root_flake.odin`: child names sanitized before embedding in Nix source. New `is_nix_identifier` ([A-Za-z_][A-Za-z0-9_'-]*) passes valid identifiers through; anything else is emitted as a quoted attrset key via new `nix_escape_string` (escapes `"`, `\`, `${`) which is also applied to names inside string literals (`path:./<name>` and the `children` list). Tests added for `weird-name`, `has"quote`, `has${dollar}`.
+- [P2] `src/nix_workspace.odin` `sync_workspace`: opportunistically prunes state entries for workspaces no longer registered before saving state.
+- [P3] `tests/git_remote_test.odin:124`: freed the `strings.join` result (no more leak warning).
+- [P3] `src/core/state.odin` `save_state`: removed misleading `defer os.remove(tmp)`; temp file now removed only on failure paths.
+- Verified: `nix build .#main` OK; `devenv test` 26/26 pass, no memory-tracking warnings.

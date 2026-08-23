@@ -134,7 +134,9 @@ print_usage :: proc() {
 	)
 	fmt.println("  nws register [PATH]     add a workspace (default: current directory)")
 	fmt.println("                          overlay options: --overlay URL --attr-path ATTR")
-	fmt.println("                          [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]")
+	fmt.println(
+		"                          [--overlay-attr NAME] [--no-flake] [--nixpkgs URL] [--resolver PATH]",
+	)
 	fmt.println("  nws unregister [PATH]   remove a workspace")
 	fmt.println("  nws list                list registered workspaces")
 	fmt.println("  nws help                show this help")
@@ -238,6 +240,7 @@ Register_Options :: struct {
 	path:     string,
 	overlays: [dynamic]core.Overlay_Entry,
 	nixpkgs:  string,
+	resolver: string,
 }
 
 cmd_register :: proc(argv: []string) {
@@ -255,6 +258,7 @@ cmd_register :: proc(argv: []string) {
 	req: core.Register_Request = core.Register_Request {
 		path        = path,
 		nixpkgs_url = opts.nixpkgs,
+		resolver    = opts.resolver,
 	}
 	if len(opts.overlays) > 0 {
 		req.is_overlay = true
@@ -283,7 +287,7 @@ parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: boo
 	fail :: proc(msg: string) {
 		fmt.eprintln("nws register:", msg)
 		fmt.eprintln(
-			"usage: nws register [PATH] [--overlay URL --attr-path ATTR ...] [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]",
+			"usage: nws register [PATH] [--overlay URL --attr-path ATTR ...] [--overlay-attr NAME] [--no-flake] [--nixpkgs URL] [--resolver PATH]",
 		)
 	}
 
@@ -333,6 +337,13 @@ parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: boo
 				return opts, false
 			}
 			opts.nixpkgs = argv[i + 1]
+			i += 2
+		case "--resolver":
+			if i + 1 >= len(argv) {
+				fail("--resolver requires a path")
+				return opts, false
+			}
+			opts.resolver = argv[i + 1]
 			i += 2
 		case:
 			if strings.has_prefix(a, "--") {
@@ -653,6 +664,7 @@ route_command :: proc(state: ^Daemon_State, line: string) -> string {
 				name        = strings.clone(norm),
 				kind        = .overlay,
 				nixpkgs_url = req.nixpkgs_url != "" ? strings.clone(req.nixpkgs_url) : "",
+				resolver    = req.resolver != "" ? strings.clone(req.resolver) : "",
 			}
 			wscfg.overlays = make([dynamic]core.Overlay_Entry, 0, len(req.overlays))
 			for ov in req.overlays {

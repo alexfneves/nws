@@ -286,6 +286,43 @@ test_url_decode_malformed :: proc(t: ^testing.T) {
 	testing.expectf(t, !ok, "invalid hex should fail")
 }
 
+// Object-form overlay workspace with a workspace-level resolver round-trips
+// through save/load, and the resolver survives a reload.
+@(test)
+test_config_overlay_resolver_roundtrip :: proc(t: ^testing.T) {
+	dir, _ := os.temp_dir(context.allocator)
+	defer delete(dir)
+	path := fmt.tprintf("%s/nws-config-resolver.json", dir)
+	defer os.remove(path)
+
+	text := `{"port": 17424, "workspaces": [{"name": "/ros/ws", "backend": "overlay", "resolver": "/home/user/bin/resolv.sh", "overlays": [{"url": "github:lopsided98/nix-ros-overlay/master", "attrPath": "rosPackages.humble"}]}]}`
+	_ = os.write_entire_file(path, text)
+
+	cfg, ok := core.load_config(path)
+	defer core.delete_workspaces(&cfg)
+	testing.expectf(t, ok, "resolver config should parse")
+	testing.expectf(t, len(cfg.workspaces) == 1, "expected 1 workspace")
+	testing.expectf(
+		t,
+		cfg.workspaces[0].resolver == "/home/user/bin/resolv.sh",
+		"resolver mismatch: %q",
+		cfg.workspaces[0].resolver,
+	)
+
+	if !core.save_config(path, cfg) {
+		testing.expectf(t, false, "save_config failed")
+		return
+	}
+	again, ok2 := core.load_config(path)
+	defer core.delete_workspaces(&again)
+	testing.expectf(t, ok2, "reload after save failed")
+	testing.expectf(
+		t,
+		len(again.workspaces) == 1 && again.workspaces[0].resolver == "/home/user/bin/resolv.sh",
+		"resolver lost on reload",
+	)
+}
+
 // clone_workspace_config deep-copies settings; the clone serializes to the
 // same bytes and compares equal by value.
 @(test)
@@ -294,6 +331,7 @@ test_workspace_config_clone_roundtrip :: proc(t: ^testing.T) {
 		name        = strings.clone("/ws/overlay"),
 		kind        = .overlay,
 		nixpkgs_url = strings.clone("github:NixOS/nixpkgs/nixos-24.11"),
+		resolver    = strings.clone("/home/user/bin/resolve.sh"),
 	}
 	orig.overlays = make([dynamic]core.Overlay_Entry)
 	defer core.delete_workspace_config(orig)

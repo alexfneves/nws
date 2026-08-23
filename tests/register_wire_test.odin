@@ -115,6 +115,38 @@ test_register_wire_register_parse_error_cases :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_register_wire_register_round_trip_resolver :: proc(t: ^testing.T) {
+	req := core.Register_Request {
+		path       = "/tmp/ws dir",
+		is_overlay = true,
+		resolver   = "/home/user/bin/resolve?x&y%z.sh",
+	}
+	append(
+		&req.overlays,
+		core.Overlay_Entry{url = "github:x/y", attr_path = "pkgs", is_flake = true},
+	)
+	defer delete(req.overlays)
+	enc := core.register_encode(&req)
+	defer delete(enc)
+
+	parsed, ok := core.register_parse(enc)
+	defer core.register_free(&parsed)
+	testing.expect_value(t, ok, true)
+	testing.expect(t, parsed.path == req.path, "path %q", parsed.path)
+	testing.expect(t, parsed.resolver == req.resolver, "resolver round-trip: %q", parsed.resolver)
+}
+
+@(test)
+test_register_wire_register_parse_resolver_param :: proc(t: ^testing.T) {
+	parsed, ok := core.register_parse(
+		"/tmp/ws?backend=overlay&resolver=/s%20r.sh&overlay=o&attrPath=a",
+	)
+	defer core.register_free(&parsed)
+	testing.expect_value(t, ok, true)
+	testing.expect(t, parsed.resolver == "/s r.sh", "resolver %q", parsed.resolver)
+}
+
+@(test)
 test_register_wire_register_parse_unknown_params_ignored_fail_open :: proc(t: ^testing.T) {
 	parsed, ok := core.register_parse("/tmp/ws?backend=overlay&future=1&overlay=o&attrPath=a")
 	defer core.register_free(&parsed)

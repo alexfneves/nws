@@ -21,6 +21,7 @@ Register_Request :: struct {
 	path:        string,
 	overlays:    [dynamic]Overlay_Entry,
 	nixpkgs_url: string,
+	resolver:    string,
 	is_overlay:  bool,
 }
 
@@ -59,6 +60,12 @@ register_encode :: proc(req: ^Register_Request, allocator := context.allocator) 
 	if len(req.nixpkgs_url) > 0 {
 		strings.write_string(&b, "&nixpkgs=")
 		seg = pct_encode_strict(req.nixpkgs_url, allocator)
+		strings.write_string(&b, seg)
+		delete(seg)
+	}
+	if len(req.resolver) > 0 {
+		strings.write_string(&b, "&resolver=")
+		seg = pct_encode_strict(req.resolver, allocator)
 		strings.write_string(&b, seg)
 		delete(seg)
 	}
@@ -192,6 +199,13 @@ register_parse :: proc(
 				return req, false
 			}
 			req.nixpkgs_url = dv
+		case "resolver":
+			dv, vok := decode(val, allocator)
+			if !vok {
+				register_parse_abort(&req)
+				return req, false
+			}
+			req.resolver = dv
 		case:
 		// Unknown parameter: ignore (fail-open forward compatibility).
 		}
@@ -224,6 +238,9 @@ register_free :: proc(req: ^Register_Request) {
 	}
 	if len(req.nixpkgs_url) > 0 {
 		delete(req.nixpkgs_url)
+	}
+	if len(req.resolver) > 0 {
+		delete(req.resolver)
 	}
 	req.path = ""
 	req.overlays = nil

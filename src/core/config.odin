@@ -27,6 +27,7 @@ Workspace_Config :: struct {
 	kind:        Workspace_Kind,
 	overlays:    [dynamic]Overlay_Entry,
 	nixpkgs_url: string, // "" = nixpkgs cascade decides (see plan)
+	resolver:    string, // "" = built-in scan only
 }
 
 // Config holds the persisted daemon settings.
@@ -150,6 +151,13 @@ parse_workspace_entry :: proc(
 		}
 	}
 
+	if rs_v, has := obj["resolver"]; has {
+		#partial switch rs in rs_v {
+		case json.String:
+			ws.resolver = strings.clone(rs, allocator)
+		}
+	}
+
 	append(out, ws)
 }
 
@@ -259,6 +267,12 @@ write_workspace_object :: proc(
 		fmt.tprintf("    \"name\": \"%s\",\n", json_escape(ws.name, allocator)),
 	)
 	strings.write_string(b, "    \"backend\": \"overlay\",\n")
+	if len(ws.resolver) > 0 {
+		strings.write_string(
+			b,
+			fmt.tprintf("    \"resolver\": \"%s\",\n", json_escape(ws.resolver, allocator)),
+		)
+	}
 	if len(ws.overlays) > 0 {
 		strings.write_string(b, "    \"overlays\": [\n")
 		for ov, i in ws.overlays {
@@ -312,6 +326,7 @@ clone_workspace_config :: proc(
 	out := Workspace_Config {
 		kind        = ws.kind,
 		nixpkgs_url = ws.nixpkgs_url != "" ? strings.clone(ws.nixpkgs_url, allocator) : "",
+		resolver    = ws.resolver != "" ? strings.clone(ws.resolver, allocator) : "",
 	}
 	out.name = strings.clone(ws.name, allocator)
 	if len(ws.overlays) > 0 {
@@ -356,12 +371,18 @@ delete_workspace_config :: proc(ws: Workspace_Config) {
 	if len(ws.nixpkgs_url) > 0 {
 		delete(ws.nixpkgs_url)
 	}
+	if len(ws.resolver) > 0 {
+		delete(ws.resolver)
+	}
 }
 
 // workspace_configs_equal reports whether two Workspace_Configs carry the same
 // settings (by value; order-sensitive for overlays).
 workspace_configs_equal :: proc(a, b: Workspace_Config) -> bool {
-	if a.name != b.name || a.kind != b.kind || a.nixpkgs_url != b.nixpkgs_url {
+	if a.name != b.name ||
+	   a.kind != b.kind ||
+	   a.nixpkgs_url != b.nixpkgs_url ||
+	   a.resolver != b.resolver {
 		return false
 	}
 	if len(a.overlays) != len(b.overlays) {

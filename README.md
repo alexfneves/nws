@@ -207,6 +207,85 @@ state survives reboots. The canonical-URL state lives next to it
 (`~/.config/nws/state.json` by default) and is pruned automatically when you
 unregister a workspace.
 
+## Overlay workspaces
+
+By default every workspace uses the flake-delegation backend described above.
+A workspace can instead use the **overlay** backend: the generated root flake
+imports a user-configured overlay flake (e.g.
+[nix-ros-overlay](https://github.com/lopsided98/nix-ros-overlay)), applies it
+over nixpkgs, and splices each child directory into the overlay's package set
+via `callPackage ./<child> {}` at a configured attribute path. Your modified
+packages shadow the upstream ones; everything else comes from the overlay.
+Sibling dependencies are resolved by the package-set fixed point (attribute
+name shadowing), not by nws — removing a clone naturally falls back to the
+upstream package.
+
+Configure it with an object entry in `workspaces` (legacy string entries keep
+the default flake backend):
+
+```json
+{
+  "port": 17424,
+  "workspaces": [
+    {
+      "name": "/home/you/ros-ws",
+      "backend": "overlay",
+      "overlays": [
+        {
+          "url": "github:lopsided98/nix-ros-overlay/master",
+          "attrPath": "rosPackages.humble"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Per-overlay-entry fields:
+
+- `url` (required) — the overlay flake URL.
+- `attrPath` (required) — the package-set attribute path to extend, e.g.
+  `rosPackages.humble`. The generated flake exposes this attribute with your
+  children spliced in.
+- `overlayAttr` (optional) — which overlay inside `overlays.<...>` to apply;
+  defaults to `"default"`.
+- `flake` (optional, default `true`) — set to `false` for a plain non-flake
+  overlay expression; it is then imported via
+  `import (builtins.fetchTarball "<url>")`.
+
+Optional per-workspace field:
+
+- `nixpkgs` — explicit nixpkgs URL for the root flake's input. When absent,
+  the **nixpkgs cascade** applies (first match wins):
+  1. workspace-level `nixpkgs` URL → `inputs.nixpkgs.url = <url>`;
+  2. else the first flake overlay exposes nixpkgs →
+     `inputs.nixpkgs.follows = "<overlay>/nixpkgs"`;
+  3. else plain `import <nixpkgs>` (channel).
+
+### Child matching
+
+Candidates are every first-level directory of the workspace plus each one's
+immediate subdirectories (so monorepo layouts work). Once per sync nws runs
+`nix eval --json <url>#<attrPath> --apply 'builtins.attrNames'` and splices
+exactly the candidates whose **basename** is an attribute of that set;
+**deepest match wins**, so if both a repo root and a subdirectory match, only
+the subdirectory is spliced. Attribute-name sets are cached in memory per
+`(url, attrPath)`.
+
+### Fail-open behaviour
+
+Overlay mode never guesses. If `nix eval` fails (no network, nix missing,
+corrupt output), nws logs a warning and keeps the last known attribute set;
+if there has never been a successful evaluation, nothing is spliced and the
+minimal managed flake is emitted instead. A wrong splice could break
+evaluation of the whole root flake, so a broken overlay degrades to "no
+overrides", never to an unbuildable flake. Overlay children need no `.git`
+and no `flake.nix`, and no canonical-URL state is kept for them.
+
+As always, a root `flake.nix` without the `# nws-generated — do not edit`
+header is user-authored and never touched, and identical regenerations are
+skipped byte-for-byte.
+
 ## Shell completion
 
 `nws` ships static tab-completion for **bash**, **zsh**, and **fish**, under
@@ -242,6 +321,19 @@ $ printf 'LIST\n' | nc 127.0.0.1 17424
 OK 1
 /home/you/workspaces/mytree
 ```
+
+## Manual verification checklist
+
+1. `nix build .#main && devenv test`.
+2. Register an overlay workspace (ROS-style config above); confirm the
+   generated flake has the managed header, follows the overlay's nixpkgs, and
+   splices a sample package dir at the configured attrPath.
+3. Touch a file in a child dir → regenerates identically (byte-skip, no loop).
+4. Delete a child dir → its attribute disappears and the upstream overlay
+   package falls through.
+5. Start the daemon without `nix` on `PATH` → a warning is logged and the
+   empty-splice minimal flake is emitted.
+6. Legacy string-array config loads and saves back byte-stable.
 
 ## Running the tests
 

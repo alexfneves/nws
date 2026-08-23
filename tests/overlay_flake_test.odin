@@ -42,16 +42,41 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
   };
   outputs = { ... }@inputs:
   let
-    overlayExpr0 = import inputs.overlay0;
-    overlaysList = [
-      overlayExpr0.overlays."default"
-    ];
-    pkgs = import inputs.nixpkgs { overlays = overlaysList; };
+    baseViaInput0 = inputs.overlay0.rosPackages.humble or null;
+    overlaySource0 = import inputs.overlay0;
+    overlayResolved0 = if builtins.isFunction overlaySource0 then overlaySource0 { system = "x86_64-linux"; } else overlaySource0;
+    base0 =
+      if baseViaInput0 != null
+      then baseViaInput0
+      else (overlayResolved0.rosPackages.humble or {});
+    childCalls0 = {
+      tf2 = prev:
+        if (prev.buildRosPackage or null) != null
+        then prev.buildRosPackage {
+          pname = "tf2";
+          version = "0.0.0";
+          src = ./tf2;
+        }
+        else prev.callPackage ./tf2 { };
+      tf2_msgs = prev:
+        if (prev.buildRosPackage or null) != null
+        then prev.buildRosPackage {
+          pname = "tf2_msgs";
+          version = "0.0.0";
+          src = ./ros/tf2_msgs;
+        }
+        else prev.callPackage ./ros/tf2_msgs { };
+    };
+    spliced0 =
+      if (base0.overrideScope' or null) != null
+      then base0.overrideScope' (final: prev: builtins.mapAttrs (_: f: f prev) childCalls0)
+      else base0 // builtins.mapAttrs (_: f: f base0) childCalls0;
   in
   {
-    rosPackages.humble = (pkgs.rosPackages.humble or {}) // {
-      tf2 = pkgs.callPackage ./tf2 { };
-      tf2_msgs = pkgs.callPackage ./ros/tf2_msgs { };
+    rosPackages.humble = spliced0;
+    packages.x86_64-linux = {
+      tf2 = spliced0.tf2;
+      tf2_msgs = spliced0.tf2_msgs;
     };
   };
 }
@@ -126,8 +151,9 @@ test_overlay_flake_weird_names_escaped :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		strings.contains(got, `"my pkg" = pkgs.callPackage ./we\"ird/\${dir}/my pkg { };`),
-		"escaped splice line missing in:\n%s",
+		strings.contains(got, `pname = "my pkg";`) &&
+		strings.contains(got, `prev.callPackage ./we\"ird/\${dir}/my pkg { };`),
+		"escaped splice lines missing in:\n%s",
 		got,
 	)
 }
@@ -158,15 +184,32 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
 {
   outputs = { ... }@inputs:
   let
-    overlayExpr0 = import (builtins.fetchTarball "https://example.com/overlay.tar.gz");
-    overlaysList = [
-      overlayExpr0.overlays."custom"
-    ];
-    pkgs = import <nixpkgs> { overlays = overlaysList; };
+    baseViaInput0 = null;
+    overlaySource0 = import (builtins.fetchTarball "https://example.com/overlay.tar.gz");
+    overlayResolved0 = if builtins.isFunction overlaySource0 then overlaySource0 { system = "x86_64-linux"; } else overlaySource0;
+    base0 =
+      if baseViaInput0 != null
+      then baseViaInput0
+      else (overlayResolved0.pkgs or {});
+    childCalls0 = {
+      foo = prev:
+        if (prev.buildRosPackage or null) != null
+        then prev.buildRosPackage {
+          pname = "foo";
+          version = "0.0.0";
+          src = ./foo;
+        }
+        else prev.callPackage ./foo { };
+    };
+    spliced0 =
+      if (base0.overrideScope' or null) != null
+      then base0.overrideScope' (final: prev: builtins.mapAttrs (_: f: f prev) childCalls0)
+      else base0 // builtins.mapAttrs (_: f: f base0) childCalls0;
   in
   {
-    pkgs = (pkgs.pkgs or {}) // {
-      foo = pkgs.callPackage ./foo { };
+    pkgs = spliced0;
+    packages.x86_64-linux = {
+      foo = spliced0.foo;
     };
   };
 }
@@ -197,11 +240,6 @@ test_overlay_flake_cascade_explicit_url :: proc(t: ^testing.T) {
 		"explicit nixpkgs url missing in:\n%s",
 		got,
 	)
-	testing.expect(
-		t,
-		strings.contains(got, "import inputs.nixpkgs"),
-		"explicit-url pkgs import missing",
-	)
 	testing.expect(t, !strings.contains(got, "follows"), "unexpected follows with explicit url")
 }
 
@@ -224,18 +262,82 @@ test_overlay_flake_cascade_follows :: proc(t: ^testing.T) {
 	)
 	testing.expect(
 		t,
-		strings.contains(got, "import inputs.nixpkgs"),
-		"follows pkgs import missing",
-	)
-	testing.expect(
-		t,
 		!strings.contains(got, "<nixpkgs>"),
 		"unexpected channel import in follows mode",
 	)
 }
 
-// Cascade branch 3: no explicit URL and no flake entry → plain channel
-// import and no inputs section at all.
+// The generated flake uses overrideScope' for scope-shaped base sets and
+// prev.callPackage inside the splice so siblings resolve via final.
+@(test)
+test_overlay_flake_override_scope_form :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child{{name = "a", rel_path = "a"}, {name = "b", rel_path = "b"}}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	testing.expect(
+		t,
+		strings.contains(
+			got,
+			"base0.overrideScope' (final: prev: builtins.mapAttrs (_: f: f prev) childCalls0)",
+		),
+		"overrideScope' branch missing in:\n%s",
+		got,
+	)
+	count := strings.count(got, "prev.callPackage")
+	testing.expectf(
+		t,
+		count == len(children),
+		"expected %d prev.callPackage refs, got %d",
+		len(children),
+		count,
+	)
+	// Children are applied with `f prev`, so sibling splices see each other
+	// through the final scope.
+	testing.expect(t, strings.contains(got, "(_: f: f prev)"), "prev application missing")
+	testing.expect(
+		t,
+		!strings.contains(got, "pkgs.callPackage"),
+		"top-level pkgs.callPackage must not be used",
+	)
+	// Plain-attrset fallback still present for sets without overrideScope'.
+	testing.expect(
+		t,
+		strings.contains(got, "else base0 // builtins.mapAttrs (_: f: f base0) childCalls0;"),
+		"fallback branch missing",
+	)
+}
+
+// packages.<system> reuses a system segment from the attrPath when present.
+@(test)
+test_overlay_flake_packages_system_from_attrpath :: proc(t: ^testing.T) {
+	testing.expect(
+		t,
+		core.system_from_attr_path("legacyPackages.x86_64-linux.noetic") == "x86_64-linux",
+	)
+	testing.expect(t, core.system_from_attr_path("packages.aarch64-darwin") == "aarch64-darwin")
+	testing.expect(t, core.system_from_attr_path("pkgs") == "x86_64-linux")
+
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child{{name = "foo", rel_path = "foo"}}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+	testing.expect(
+		t,
+		strings.contains(got, "packages.x86_64-linux = {"),
+		"packages output missing:\n%s",
+		got,
+	)
+	testing.expect(t, strings.contains(got, "      foo = spliced0.foo;"), "packages entry missing")
+}
+
+// Cascade branch 3: non-flake entry → no inputs section; base comes from
+// the fetchTarball-resolved overlay source.
 @(test)
 test_overlay_flake_cascade_channel :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
@@ -248,8 +350,8 @@ test_overlay_flake_cascade_channel :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		strings.contains(got, "import <nixpkgs> "),
-		"channel import missing in:\n%s",
+		strings.contains(got, `overlaySource0 = import (builtins.fetchTarball`),
+		"fetchTarball source missing in:\n%s",
 		got,
 	)
 	testing.expect(

@@ -1178,6 +1178,11 @@ scan_candidates :: proc(path: string) -> [dynamic]string {
 		if fi.type != .Directory {
 			continue
 		}
+		// Hidden directories (.git-style internals, the user's opt-in .nws
+		// overrides folder) are never child candidates.
+		if strings.has_prefix(fi.name, ".") {
+			continue
+		}
 		rel := strings.clone(fi.name, context.allocator)
 		append(&res, rel)
 		sub_fis, serr := os.read_directory_by_path(fi.fullpath, -1, context.allocator)
@@ -1277,6 +1282,10 @@ local_repos :: proc(path: string) -> [dynamic]string {
 	defer os.file_info_slice_delete(fis, context.allocator)
 	for fi in fis {
 		if fi.type != .Directory {
+			continue
+		}
+		// Hidden directories are never local clones.
+		if strings.has_prefix(fi.name, ".") {
 			continue
 		}
 		git := strings.concatenate({fi.fullpath, "/.git"}, context.allocator)

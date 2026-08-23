@@ -51,7 +51,9 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
       else (overlayResolved0.rosPackages.humble or {});
     childCalls0 = {
       tf2 = prev:
-        if (prev.buildRosPackage or null) != null
+        if builtins.pathExists ./.nws/packages/tf2.nix
+        then prev.callPackage ./.nws/packages/tf2.nix { }
+        else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2";
           version = "0.0.0";
@@ -59,7 +61,9 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
         }
         else prev.callPackage ./tf2 { };
       tf2_msgs = prev:
-        if (prev.buildRosPackage or null) != null
+        if builtins.pathExists ./.nws/packages/tf2_msgs.nix
+        then prev.callPackage ./.nws/packages/tf2_msgs.nix { }
+        else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2_msgs";
           version = "0.0.0";
@@ -139,6 +143,32 @@ test_overlay_flake_empty_children :: proc(t: ^testing.T) {
 	testing.expect(t, core.is_managed_root(got))
 }
 
+// Every child splice is guarded by a pathExists check on the user's hidden
+// overrides folder, so an absent .nws directory falls through to the bare
+// source build and a present file is called with callPackage against the
+// spliced scope.
+@(test)
+test_overlay_flake_user_override_conditional :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child{{name = "turtlebot3_msgs", rel_path = "tb3/turtlebot3_msgs"}}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	want_block := `turtlebot3_msgs = prev:
+        if builtins.pathExists ./.nws/packages/turtlebot3_msgs.nix
+        then prev.callPackage ./.nws/packages/turtlebot3_msgs.nix { }
+        else if (prev.buildRosPackage or null) != null
+`
+	testing.expectf(
+		t,
+		strings.contains(got, want_block),
+		"user-override conditional missing in:\n%s",
+		got,
+	)
+}
+
 // Weird directory names are escaped correctly in attr keys and path strings.
 @(test)
 test_overlay_flake_weird_names_escaped :: proc(t: ^testing.T) {
@@ -193,7 +223,9 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
       else (overlayResolved0.pkgs or {});
     childCalls0 = {
       foo = prev:
-        if (prev.buildRosPackage or null) != null
+        if builtins.pathExists ./.nws/packages/foo.nix
+        then prev.callPackage ./.nws/packages/foo.nix { }
+        else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "foo";
           version = "0.0.0";
@@ -288,11 +320,12 @@ test_overlay_flake_override_scope_form :: proc(t: ^testing.T) {
 		got,
 	)
 	count := strings.count(got, "prev.callPackage")
+	// Two refs per child: the .nws override call and the bare fallback.
 	testing.expectf(
 		t,
-		count == len(children),
+		count == 2 * len(children),
 		"expected %d prev.callPackage refs, got %d",
-		len(children),
+		2 * len(children),
 		count,
 	)
 	// Children are applied with `f prev`, so sibling splices see each other

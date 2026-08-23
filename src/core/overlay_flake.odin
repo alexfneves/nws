@@ -178,7 +178,9 @@ generate_overlay_root_flake :: proc(
 	//    child with `prev.callPackage` so siblings see each other via final;
 	//  - plain attrsets: fall back to `base // mapAttrs apply childCalls`.
 	// Children calls are emitted once as an attrset of functions (`childCalls`)
-	// shared by both branches. v1 targets the single-entry case; multi-entry
+	// shared by both branches. Each child call first checks for a user override
+	// expression at `./.nws/packages/<name>.nix` and uses it via callPackage when
+	// present. v1 targets the single-entry case; multi-entry
 	// simply repeats the splice set per attrPath.
 	for e in 0 ..< len(cfg.overlays) {
 		strings.write_string(&b, "    childCalls")
@@ -187,13 +189,20 @@ generate_overlay_root_flake :: proc(
 		for c in sorted {
 			strings.write_string(&b, "      ")
 			write_attr_key(&b, c.name)
+			// Per-child user override hook: when the workspace has a hidden
+			// .nws/packages/<name>.nix, it is called with callPackage against
+			// the spliced scope (so sibling-named dependencies resolve locally).
+			// Absence of the file falls through to the bare source build.
+			strings.write_string(&b, " = prev:\n        if builtins.pathExists ./.nws/packages/")
+			nix_escape_string(&b, c.name)
+			strings.write_string(&b, ".nix\n")
+			strings.write_string(&b, "        then prev.callPackage ./.nws/packages/")
+			nix_escape_string(&b, c.name)
+			strings.write_string(&b, ".nix { }\n")
 			// Raw source checkouts (no default.nix) are built through the
 			// distro scope's buildRosPackage; plain callPackage remains as the
 			// fallback for scopes without it.
-			strings.write_string(
-				&b,
-				" = prev:\n        if (prev.buildRosPackage or null) != null\n",
-			)
+			strings.write_string(&b, "        else if (prev.buildRosPackage or null) != null\n")
 			strings.write_string(&b, "        then prev.buildRosPackage {\n")
 			strings.write_string(&b, "          pname = \"")
 			nix_escape_string(&b, c.name)

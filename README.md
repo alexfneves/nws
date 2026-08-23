@@ -288,6 +288,46 @@ Optional per-workspace field:
      `inputs.nixpkgs.follows = "<overlay>/nixpkgs"`;
   3. else plain `import <nixpkgs>` (channel).
 
+### Per-child user overrides: `.nws/packages/<attr-name>.nix`
+
+Every spliced child in a generated overlay flake is guarded by a check on a
+hidden, user-owned overrides folder:
+
+```nix
+<name> = prev:
+  if builtins.pathExists ./.nws/packages/<name>.nix
+  then prev.callPackage ./.nws/packages/<name>.nix { }
+  else <bare source build (buildRosPackage / callPackage ./<child> { })>;
+```
+
+If `<workspace>/.nws/packages/<attr-name>.nix` exists, it is called with
+`callPackage` **against the spliced package set**, so its arguments are its
+dependencies — and any dependency whose attribute name matches another spliced
+child resolves to your local sibling instead of the upstream package.
+nws never creates this folder; it is purely opt-in, and absence is fine (the
+`pathExists` guard simply falls through to the bare build).
+
+Example for ROS 1, overriding `turtlebot3_msgs` while keeping its source in
+the untouched clone:
+
+```nix
+# /path/to/workspace/.nws/packages/turtlebot3_msgs.nix
+{ buildRosPackage, catkin, message_generation, message_runtime, rospy }:
+buildRosPackage {
+  pname = "turtlebot3_msgs";
+  version = "1.0.1";
+  src = ../turtlebot3_msgs;          # points back at the untouched clone
+  buildType = "catkin";
+  propagatedBuildInputs = [ message_generation message_runtime rospy ];
+}
+```
+
+Note that `src` is relative to `.nws/packages/`, so it points back out at the
+clone — which nws never modifies. Children without an override file fail open:
+they keep the bare `buildRosPackage`/`callPackage` behaviour described above.
+The daemon ignores `.nws` when scanning for child candidates (hidden
+directories are never children), so only real repos are spliced.
+
 ### Child matching
 
 Candidates are every first-level directory of the workspace plus each one's

@@ -94,29 +94,30 @@ root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 		strings.write_string(b, `"`)
 	}
 	strings.write_string(b, ` ];` + "\n")
+	strings.write_string(b, `    perSystem = out: sys:` + "\n")
+	strings.write_string(b, `      builtins.listToAttrs (builtins.concatMap` + "\n")
+	strings.write_string(b, `        (child:` + "\n")
+	strings.write_string(b, `          let v = inputs.${child}.${out}.${sys} or null; in` + "\n")
+	strings.write_string(b, `          if v == null then [] else` + "\n")
+	strings.write_string(b, `            builtins.attrValues (builtins.mapAttrs` + "\n")
+	strings.write_string(
+		b,
+		`              (attrName: val: { name = "${child}-${attrName}"; value = val; })` + "\n",
+	)
+	strings.write_string(b, `              v)` + "\n")
+	strings.write_string(b, `        )` + "\n")
+	strings.write_string(b, `        children` + "\n")
+	strings.write_string(b, `      );` + "\n")
 	strings.write_string(b, `    systemsOf = out:` + "\n")
 	strings.write_string(
 		b,
-		`      builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children;` +
+		`      builtins.attrNames (builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children);` +
 		"\n",
 	)
 	strings.write_string(b, `    delegate = out:` + "\n")
-	strings.write_string(b, `      builtins.mapAttrs` + "\n")
-	strings.write_string(b, `        (sys: _:` + "\n")
-	strings.write_string(b, `          builtins.listToAttrs (builtins.concatMap` + "\n")
-	strings.write_string(b, `            (child:` + "\n")
-	strings.write_string(
-		b,
-		`              let v = inputs.${child}.${out}.${sys} or null; in` + "\n",
-	)
-	strings.write_string(b, `              if v == null then [] else` + "\n")
-	strings.write_string(b, `              builtins.attrValues (builtins.mapAttrs` + "\n")
-	strings.write_string(
-		b,
-		`                (attrName: val: { name = "${child}-${attrName}"; inherit val; })` + "\n",
-	)
-	strings.write_string(b, `                v))` + "\n")
-	strings.write_string(b, `            children));` + "\n")
+	strings.write_string(b, `      builtins.listToAttrs (builtins.map` + "\n")
+	strings.write_string(b, `        (sys: { name = sys; value = perSystem out sys; })` + "\n")
+	strings.write_string(b, `        (systemsOf out));` + "\n")
 	strings.write_string(b, "  in\n")
 	strings.write_string(b, "  {\n")
 	strings.write_string(b, `    packages = delegate "packages";` + "\n")

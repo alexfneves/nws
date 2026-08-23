@@ -27,19 +27,23 @@ test_root_flake_golden :: proc(t: ^testing.T) {
   outputs = { self, ... }@inputs:
   let
     children = [ "alpha" "mid" "zeta" ];
+    perSystem = out: sys:
+      builtins.listToAttrs (builtins.concatMap
+        (child:
+          let v = inputs.${child}.${out}.${sys} or null; in
+          if v == null then [] else
+            builtins.attrValues (builtins.mapAttrs
+              (attrName: val: { name = "${child}-${attrName}"; value = val; })
+              v)
+        )
+        children
+      );
     systemsOf = out:
-      builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children;
+      builtins.attrNames (builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children);
     delegate = out:
-      builtins.mapAttrs
-        (sys: _:
-          builtins.listToAttrs (builtins.concatMap
-            (child:
-              let v = inputs.${child}.${out}.${sys} or null; in
-              if v == null then [] else
-              builtins.attrValues (builtins.mapAttrs
-                (attrName: val: { name = "${child}-${attrName}"; inherit val; })
-                v))
-            children));
+      builtins.listToAttrs (builtins.map
+        (sys: { name = sys; value = perSystem out sys; })
+        (systemsOf out));
   in
   {
     packages = delegate "packages";
@@ -182,19 +186,23 @@ test_root_flake_empty_children :: proc(t: ^testing.T) {
   outputs = { self, ... }@inputs:
   let
     children = [ ];
+    perSystem = out: sys:
+      builtins.listToAttrs (builtins.concatMap
+        (child:
+          let v = inputs.${child}.${out}.${sys} or null; in
+          if v == null then [] else
+            builtins.attrValues (builtins.mapAttrs
+              (attrName: val: { name = "${child}-${attrName}"; value = val; })
+              v)
+        )
+        children
+      );
     systemsOf = out:
-      builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children;
+      builtins.attrNames (builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children);
     delegate = out:
-      builtins.mapAttrs
-        (sys: _:
-          builtins.listToAttrs (builtins.concatMap
-            (child:
-              let v = inputs.${child}.${out}.${sys} or null; in
-              if v == null then [] else
-              builtins.attrValues (builtins.mapAttrs
-                (attrName: val: { name = "${child}-${attrName}"; inherit val; })
-                v))
-            children));
+      builtins.listToAttrs (builtins.map
+        (sys: { name = sys; value = perSystem out sys; })
+        (systemsOf out));
   in
   {
     packages = delegate "packages";
@@ -264,19 +272,23 @@ test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
   outputs = { self, ... }@inputs:
   let
     children = [ "has\"quote" "has\${dollar}" "weird-name" ];
+    perSystem = out: sys:
+      builtins.listToAttrs (builtins.concatMap
+        (child:
+          let v = inputs.${child}.${out}.${sys} or null; in
+          if v == null then [] else
+            builtins.attrValues (builtins.mapAttrs
+              (attrName: val: { name = "${child}-${attrName}"; value = val; })
+              v)
+        )
+        children
+      );
     systemsOf = out:
-      builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children;
+      builtins.attrNames (builtins.foldl' (acc: child: acc // (inputs.${child}.${out} or { })) { } children);
     delegate = out:
-      builtins.mapAttrs
-        (sys: _:
-          builtins.listToAttrs (builtins.concatMap
-            (child:
-              let v = inputs.${child}.${out}.${sys} or null; in
-              if v == null then [] else
-              builtins.attrValues (builtins.mapAttrs
-                (attrName: val: { name = "${child}-${attrName}"; inherit val; })
-                v))
-            children));
+      builtins.listToAttrs (builtins.map
+        (sys: { name = sys; value = perSystem out sys; })
+        (systemsOf out));
   in
   {
     packages = delegate "packages";

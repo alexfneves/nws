@@ -45,7 +45,7 @@ Tag: `workspace-root-flake` · Plan: `.pi/plans/2026-07-14-workspace-root-flake/
 - Acceptance: ISC-5,6,7,8; child flakes untouched; no rewrite when bytes identical (no self-trigger loop).
 - Anti-pattern: do NOT modify child flakes; do NOT call the old `core.sync_flake` rewrite path.
 
-## T5: Retire the line-rewrite transform + migrate tests
+## T5: DONE — Retire the line-rewrite transform + migrate tests
 - Files: `src/core/flake.odin` (reduce to `extract_marker` or delete), `tests/flake_test.odin` (replace with generator tests or delete if superseded by T2 tests)
 - Keep only helpers still referenced (marker extraction). Ensure `odin build src/nix_workspace.odin -file -collection:nwscore=src` still compiles.
 - Acceptance: `nix build .#main` and `devenv test` pass; no references to removed procs.

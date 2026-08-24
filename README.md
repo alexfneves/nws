@@ -77,6 +77,7 @@ nws service [--config-path PATH]  run the daemon (watches workspaces, serves the
 nws register [PATH]     add a workspace (default: current directory)
                         overlay options: --overlay URL --attr-path ATTR
                         [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]
+                        [--resolver SCRIPT]
 nws unregister [PATH]   remove a workspace
 nws list                list registered workspaces
 nws help                show this help
@@ -216,7 +217,9 @@ A workspace can instead use the **overlay** backend: the generated root flake
 imports a user-configured overlay flake (e.g.
 [nix-ros-overlay](https://github.com/lopsided98/nix-ros-overlay)), applies it
 over nixpkgs, and splices each child directory into the overlay's package set
-via `callPackage ./<child> {}` at a configured attribute path. Your modified
+at a configured attribute path — a `src` override when the overlay already
+defines the child name, a source build (buildRosPackage/callPackage)
+otherwise (see "Child discovery" below). Your modified
 packages shadow the upstream ones; everything else comes from the overlay.
 Sibling dependencies are resolved by the package-set fixed point (attribute
 name shadowing), not by nws — removing a clone naturally falls back to the
@@ -233,6 +236,13 @@ nws register /tmp/ws \
   --overlay github:lopsided98/nix-ros-overlay/ros1-25.05 \
   --attr-path rosPackages.noetic
 
+# Same, with an external resolver script that maps package names to repo
+# paths the built-in scan would not find (see "External resolver" below):
+nws register /tmp/ws \
+  --overlay github:lopsided98/nix-ros-overlay/ros1-25.05 \
+  --attr-path rosPackages.noetic \
+  --resolver /home/you/ros-ws/find_packages.sh
+
 # Non-flake overlay with a named attribute and explicit nixpkgs:
 nws register /tmp/ws2 \
   --overlay 'github:foo/bar' --attr-path pkgs --overlay-attr myOverlay \
@@ -243,6 +253,10 @@ nws register /tmp/ws2 \
   following `--attr-path`. An `--overlay` without its `--attr-path` is a
   usage error, as is an `--attr-path`/`--overlay-attr`/`--no-flake` with no
   preceding `--overlay`.
+- `--resolver SCRIPT` (optional, workspace-level) — a script the daemon runs
+  once per sync to discover external packages that are not plain clones (see
+  [External resolver](#external-resolver) below). Absent, only the built-in
+  recursive scan is used.
 - Presence of any `--overlay` selects the overlay backend; plain
   `nws register <path>` keeps the default flake backend.
 
@@ -279,8 +293,10 @@ Per-overlay-entry fields:
   overlay expression; it is then imported via
   `import (builtins.fetchTarball "<url>")`.
 
-Optional per-workspace field:
+Optional per-workspace fields:
 
+- `resolver` — a script path for external package discovery, mirroring the
+  `--resolver` CLI flag.
 - `nixpkgs` — explicit nixpkgs URL for the root flake's input. When absent,
   the **nixpkgs cascade** applies (first match wins):
   1. workspace-level `nixpkgs` URL → `inputs.nixpkgs.url = <url>`;
@@ -328,25 +344,86 @@ they keep the bare `buildRosPackage`/`callPackage` behaviour described above.
 The daemon ignores `.nws` when scanning for child candidates (hidden
 directories are never children), so only real repos are spliced.
 
-### Child matching
+### Child discovery: built-in recursive scan
 
-Candidates are every first-level directory of the workspace plus each one's
-immediate subdirectories (so monorepo layouts work). Once per sync nws runs
-`nix eval --json <url>#<attrPath> --apply 'builtins.attrNames'` and splices
-exactly the candidates whose **basename** is an attribute of that set;
-**deepest match wins**, so if both a repo root and a subdirectory match, only
-the subdirectory is spliced. Attribute-name sets are cached in memory per
-`(url, attrPath)`.
+Discovery is a built-in **recursive scan** of the workspace (always on),
+unioned with an optional external **resolver** script (see below). The scan
+recurses from the workspace root and emits one child per directory that owns
+`flake.nix` **or any `.nix` file**, and never descends into such a directory
+(the package boundary) — so nested workspace trees yield one package per
+flow-folder. Hidden entries (leading `.`, e.g. `.git`, `.nws`) are never
+children and are never descended into. Children are sorted by rel_path
+(deterministic). Scanning is bounded by a depth cap (3 segments below root, so
+`monorepo/pkg/foo` is the deepest recognized shape) and a count cap (200
+children); hitting either logs a warning and stops at that boundary — it
+never fails.
+
+Each discovered child is spliced to replace the upstream package whose
+**attribute name matches the child's basename**: when the name exists in the
+overlay scope, the splice is a `src` override that inherits the package's
+dependencies from the overlay rather than re-parsing them:
+
+```nix
+<name> = prev:
+  if builtins.pathExists ./.nws/packages/<name>.nix
+  then prev.callPackage ./.nws/packages/<name>.nix { }
+  else if (prev.<name> or null) != null
+  then prev.<name>.overrideAttrs (final: { src = ./<rel_path>; })
+  else if (prev.buildRosPackage or null) != null
+  then prev.buildRosPackage { pname="<name>"; version="0.0.0"; src=./<rel_path>; }
+  else prev.callPackage ./<rel_path> { };
+```
+
+So for a plain clone of a package the overlay already defines, the clone
+shadows the upstream source while dependency resolution comes straight from
+the overlay. The `.nws/packages` override hook and the `buildRosPackage` /
+bare `callPackage` fallbacks stay for raw checkouts that cannot be cloned.
+
+Every spliced child is also collected into a `default` output
+(`default = { <name> = spliced0.<name>; ... }`), so a bare `nix build` from
+the workspace root builds the whole substitution set with no extra
+arguments; `packages.<system>` re-exports the same set for `--attr` access.
+
+### External resolver
+
+For packages that a plain directory scan cannot recognise, a workspace can
+point at a **resolver script** (`--resolver SCRIPT` / `resolver` config
+field). Once per sync nws runs the script once with the workspace root as its
+working directory and first argument, and parses its stdout. Each line's
+`NAME<TAB>RELPATH` yields one spliced child (NAME = overlay attribute key,
+RELPATH = path relative to the workspace root):
+
+```bash
+#!/usr/bin/env bash
+# ROS example: emit `NAME<TAB>RELPATH` for every package.xml under the
+# workspace root (RELPATH relative to the root, which is argv[1]).
+root=$1
+cd "$root" || exit 1
+find . -name package.xml | while read -r f; do
+  d=$(dirname "$f")
+  name=$(awk -F'[<>]' '/<name>/{print $3; exit}' "$f")
+  [ -n "$name" ] && printf '%s\t%s\n' "$name" "${d#./}"
+done
+```
+
+Malformed lines (blank, no tab, empty NAME/RELPATH) are skipped fail-open; a
+RELPATH that is not relative (absolute) aborts the whole parse; a non-zero
+exit or spawn failure yields no children from the resolver, but never fails
+the regeneration — the built-in scan's children and a minimal flake are still
+emitted. When the same package name arrives from both producers at different
+paths, the resolver wins (authoritative) and a warning is logged; the same
+physical path from both is deduplicated. Everything runs on the daemon's
+single thread (inline subprocess, no threads).
 
 ### Fail-open behaviour
 
-Overlay mode never guesses. If `nix eval` fails (no network, nix missing,
-corrupt output), nws logs a warning and keeps the last known attribute set;
-if there has never been a successful evaluation, nothing is spliced and the
-minimal managed flake is emitted instead. A wrong splice could break
-evaluation of the whole root flake, so a broken overlay degrades to "no
-overrides", never to an unbuildable flake. Overlay children need no `.git`
-and no `flake.nix`, and no canonical-URL state is kept for them.
+Overlay mode never guesses. A broken resolver (bad script, network lookup
+inside it fails, non-zero exit) degrades to the built-in scan's children and
+a minimal managed flake — never to a flake that hard-breaks eval. A wrong
+splice could break evaluation of the whole root flake, so a broken overlay
+degrades to "no overrides", never to an unbuildable flake. Overlay children
+need no `.git` and no `flake.nix`, and no canonical-URL state is kept for
+them.
 
 As always, a root `flake.nix` without the `# nws-generated — do not edit`
 header is user-authored and never touched, and identical regenerations are
@@ -372,7 +449,8 @@ What completes:
 
 - `nws <TAB>` — subcommands `service register unregister list help`.
 - `nws register <TAB>` — filesystem paths; `--<TAB>` offers the overlay flags
-  (`--overlay`, `--attr-path`, `--overlay-attr`, `--no-flake`, `--nixpkgs`).
+  (`--overlay`, `--attr-path`, `--overlay-attr`, `--no-flake`, `--nixpkgs`,
+  `--resolver`).
 - `nws unregister <TAB>` — registered workspace canonical paths, **only while
   the daemon is reachable**; falls back to plain filesystem completion
   otherwise (never hangs).
@@ -393,7 +471,8 @@ The path segment escapes space, `%`, `?`, `&`, and `=`, so the first `?`
 unambiguously starts the query. Query keys: `backend=overlay`; repeatable
 `overlay=`/`attrPath=` pairs (each overlay needs its attrPath); optional
 `overlayAttr=` and `flake=false` applying to the latest overlay; and optional
-workspace-level `nixpkgs=`. A bare legacy `REGISTER <pct(path)>` keeps the
+workspace-level `nixpkgs=` and `resolver=`. A bare legacy
+`REGISTER <pct(path)>` keeps the
 default flake backend. Malformed requests (bad escapes, unsupported backend,
 incomplete pairing) get an `ERROR` reply.
 
@@ -411,12 +490,23 @@ OK 1
    confirm config.json now contains the overlay workspace object, the
    generated flake has the managed header, follows the overlay's nixpkgs,
    and splices a sample package dir at the configured attrPath.
-3. Touch a file in a child dir → regenerates identically (byte-skip, no loop).
-4. Delete a child dir → its attribute disappears and the upstream overlay
+3. Register the same workspace with `--resolver /path/to/resolver.sh`; the
+   resolver round-trips into config.json (`resolver` field) and the wire
+   (`&resolver=` query param).
+4. `git clone` a real ROS package into the workspace → the daemon regenerates
+   the flake with a `src` override for it, and the same clone still builds
+   against overlay-inherited dependencies (claim token: `overrideAttrs`
+   dep-inheritance). Touch a file in a child dir → regenerates identically
+   (byte-skip, no loop).
+5. A resolver that exists but exits non-zero (or emits junk) → warning logged,
+   the built-in scan's children still spliced, minimal flake still emitted
+   (fail-open); daemon needs no `nix` binary on `PATH` at all for overlay
+   discovery.
+6. Bare `nix build` from the workspace root (no args) builds the substituted
+   child set via the `default` output.
+7. Delete a child dir → its attribute disappears and the upstream overlay
    package falls through.
-5. Start the daemon without `nix` on `PATH` → a warning is logged and the
-   empty-splice minimal flake is emitted.
-6. Legacy string-array config loads and saves back byte-stable.
+8. Legacy string-array config loads and saves back byte-stable.
 
 ## Running the tests
 
@@ -428,7 +518,10 @@ This runs `odin test tests -collection:nwscore=src` via the flake's
 `enterTest` hook, plus the completion-script check and the `odinfmt` pre-commit
 hook. Unit tests cover the root-flake generator (golden output, determinism,
 sibling overrides, escaping), the inputs-block parser, git-remote parsing,
-state round-trips, and config handling.
+state round-trips, config handling, the overlay child scanner (clamp, depth
+and count caps, hidden-dir skip), the resolver line parser, and the
+builtin+resolver merge (rel_path dedup, resolver-wins), plus regenerated
+overlay goldens and a `default`-output test.
 
 After changes, also verify the build:
 
@@ -461,6 +554,14 @@ Stop with `Ctrl-C`.
   - `git_remote.odin` — fail-open `.git/config` origin parser.
   - `state.odin` — atomic canonical-URL state (`state.json`).
   - `config.odin` — config load/save.
+  - `scan_children.odin` — recursive overlay child scanner (flattening seam
+    injected, pure).
+  - `resolver.odin` — external resolver `NAME\tRELPATH` line parser and
+    inline subprocess runner (fail-open).
+  - `merge_children.odin` — union/dedup/sort of builtin scan + resolver.
+  - `overlay_flake.odin` — overlay root-flake generator (src-override
+    children, `default` output).
+  - `register_wire.odin` — REGISTER query-wire encode/parse.
   - `url.odin` — percent encode/decode for the wire protocol.
 - `tests/` — `package tests`; unit tests run by `odin test tests`.
 - `completions/` — bash/zsh/fish completion sources.

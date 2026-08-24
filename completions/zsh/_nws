@@ -17,7 +17,7 @@ _nws() {
     case $words[2] in
         register)
             local -a reg_flags
-            reg_flags=(--overlay --attr-path --overlay-attr --no-flake --nixpkgs)
+            reg_flags=(--overlay --attr-path --overlay-attr --no-flake --nixpkgs --resolver)
             if [[ "$words[CURRENT]" == -* ]]; then
                 _describe 'flag' reg_flags
             else

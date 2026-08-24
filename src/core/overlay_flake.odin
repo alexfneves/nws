@@ -36,7 +36,9 @@ Overlay_Child :: struct {
 // Non-flake entries (`is_flake == false`) are imported via
 // `import (builtins.fetchTarball "<url>")` instead of a flake input.
 //
-// With zero matched children a minimal valid managed flake is emitted.
+// Children whose name or rel_path cannot be emitted as a Nix path token are
+// skipped fail-open (see is_path_token_safe) so the flake stays evaluable.
+// With no safe children a minimal valid managed flake is emitted.
 // The returned string is allocated from `allocator` and owned by the caller.
 generate_overlay_root_flake :: proc(
 	matched: []Overlay_Child,
@@ -55,8 +57,21 @@ generate_overlay_root_flake :: proc(
 		return a.rel_path < b.rel_path
 	})
 
-	// Zero children: minimal valid managed flake (still passes is_managed_root).
-	if len(sorted) == 0 {
+	// A child whose name or rel_path cannot be written as a bare Nix path
+	// token is skipped — omitted from childCalls, packages.<system> and default
+	// alike — so the generated flake stays evaluable. Such paths (spaces,
+	// quotes, backslashes, `#`, `${`, control chars, or empty) simply cannot be
+	// represented and are dropped rather than breaking every generated flake.
+	emit := make([dynamic]Overlay_Child, 0, len(sorted), allocator)
+	defer delete(emit)
+	for c in sorted {
+		if is_path_token_safe(c.rel_path) && is_path_token_safe(c.name) {
+			append(&emit, c)
+		}
+	}
+
+	// Zero safe children: minimal valid managed flake (still passes is_managed_root).
+	if len(emit) == 0 {
 		b := strings.builder_make(allocator)
 		defer strings.builder_destroy(&b)
 		strings.write_string(&b, MANAGED_ROOT_HEADER)
@@ -186,35 +201,31 @@ generate_overlay_root_flake :: proc(
 		strings.write_string(&b, "    childCalls")
 		write_int(&b, e)
 		strings.write_string(&b, " = {\n")
-		for c in sorted {
+		for c in emit {
 			strings.write_string(&b, "      ")
 			write_attr_key(&b, c.name)
 			// Per-child user override hook: when the workspace has a hidden
 			// .nws/packages/<name>.nix, it is called with callPackage against
-			// the spliced scope (so sibling-named dependencies resolve locally).
+			// the spliced scope (so sibling-named deps resolve locally).
 			// Absence of the file falls through to the bare source build.
-			// Per-child user override hook: when the workspace has a hidden
-			// .nws/packages/<name>.nix, it is called with callPackage against
-			// the spliced scope (so sibling-named dependencies resolve locally).
-			// Absence of the file falls through to the bare source build.
-			// Paths are emitted as quoted Nix strings (nix_escape_string then
-			// handles spaces/"s/backslashes correctly).
-			strings.write_string(&b, " = prev:\n        if builtins.pathExists \"./.nws/packages/")
-			nix_escape_string(&b, c.name)
-			strings.write_string(&b, ".nix\"\n")
-			strings.write_string(&b, "        then prev.callPackage \"./.nws/packages/")
-			nix_escape_string(&b, c.name)
-			strings.write_string(&b, ".nix\" { }\n")
-			// When the child name exists in the spliced overlay scope, src-override
+			// Paths are emitted as unquoted Nix path tokens — quoted strings
+			// fail Nix eval; unsafe names are already skipped above.
+			strings.write_string(&b, " = prev:\n        if builtins.pathExists ./.nws/packages/")
+			strings.write_string(&b, c.name)
+			strings.write_string(&b, ".nix\n")
+			strings.write_string(&b, "        then prev.callPackage ./.nws/packages/")
+			strings.write_string(&b, c.name)
+			strings.write_string(&b, ".nix { }\n")
+			// When the child name exists in the spliced scope, src-override
 			// it: dependencies are inherited from the overlay rather than re-parsed.
 			strings.write_string(&b, "        else if (prev.")
 			write_attr_key(&b, c.name)
 			strings.write_string(&b, " or null) != null\n")
 			strings.write_string(&b, "        then prev.")
 			write_attr_key(&b, c.name)
-			strings.write_string(&b, ".overrideAttrs (final: { src = \"./")
-			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, "\"; })\n")
+			strings.write_string(&b, ".overrideAttrs (final: { src = ./")
+			strings.write_string(&b, c.rel_path)
+			strings.write_string(&b, "; })\n")
 			// Raw source checkouts (no default.nix) are built through the
 			// distro scope's buildRosPackage; plain callPackage remains as the
 			// fallback for scopes without it.
@@ -224,13 +235,13 @@ generate_overlay_root_flake :: proc(
 			nix_escape_string(&b, c.name)
 			strings.write_string(&b, "\";\n")
 			strings.write_string(&b, "          version = \"0.0.0\";\n")
-			strings.write_string(&b, "          src = \"./")
-			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, "\";\n")
+			strings.write_string(&b, "          src = ./")
+			strings.write_string(&b, c.rel_path)
+			strings.write_string(&b, ";\n")
 			strings.write_string(&b, "        }\n")
-			strings.write_string(&b, "        else prev.callPackage \"./")
-			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, "\" { };\n")
+			strings.write_string(&b, "        else prev.callPackage ./")
+			strings.write_string(&b, c.rel_path)
+			strings.write_string(&b, " { };\n")
 		}
 		strings.write_string(&b, "    };\n")
 
@@ -284,7 +295,7 @@ generate_overlay_root_flake :: proc(
 	strings.write_string(&b, "    packages.")
 	strings.write_string(&b, system_from_attr_path(first_ap))
 	strings.write_string(&b, " = {\n")
-	for c in sorted {
+	for c in emit {
 		strings.write_string(&b, "      ")
 		write_attr_key(&b, c.name)
 		strings.write_string(&b, " = spliced0.")
@@ -296,7 +307,7 @@ generate_overlay_root_flake :: proc(
 	// Convenience aggregated output: default = { <name> = spliced0.<name>; ... }
 	// so a bare `nix build` builds the substitution set.
 	strings.write_string(&b, "    default = {\n")
-	for c in sorted {
+	for c in emit {
 		strings.write_string(&b, "      ")
 		write_attr_key(&b, c.name)
 		strings.write_string(&b, " = spliced0.")
@@ -335,6 +346,34 @@ write_int :: proc(b: ^strings.Builder, i: int) {
 	for j := count - 1; j >= 0; j -= 1 {
 		strings.write_byte(b, digits[j])
 	}
+}
+
+// is_path_token_safe reports whether s can be emitted as an unquoted Nix path
+// token. Nix path tokens must be non-empty and cannot contain whitespace,
+// quotes, backslashes, `#`, `${`, or control characters.
+is_path_token_safe :: proc(s: string) -> bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i += 1 {
+		c := s[i]
+		if c == ' ' ||
+		   c == '\t' ||
+		   c == '\n' ||
+		   c == '\r' ||
+		   c < 32 ||
+		   c == '"' ||
+		   c == '\\' ||
+		   c == '#' {
+			return false
+		}
+		// Nix anti-quotation: literal ${ inside an interpolation begins a
+		// string escape that would consume the rest of the token.
+		if c == '$' && i + 1 < len(s) && s[i + 1] == '{' {
+			return false
+		}
+	}
+	return true
 }
 
 // write_attr_path writes a dotted attrPath ("rosPackages.humble") as bare

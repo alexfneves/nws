@@ -220,3 +220,67 @@ test_merge_resolver_only :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, len(warn) == 0, "unexpected warning %q", warn)
 }
+
+@(test)
+test_merge_name_dedup_two_scan_dirs :: proc(t: ^testing.T) {
+	// Two scanned dirs share a basename at different rel_paths
+	// (vendor_a/tf2 and vendor_b/tf2): duplicate Nix attr keys would break
+	// eval, so the lexicographically smallest rel_path wins and the other is
+	// dropped with a warning.
+	builtin := []core.Overlay_Child {
+		core.Overlay_Child{name = "tf2", rel_path = "vendor_b/tf2"},
+		core.Overlay_Child{name = "tf2", rel_path = "vendor_a/tf2"},
+		core.Overlay_Child{name = "bar", rel_path = "b"},
+	}
+	got, warn := core.merge_children(builtin, nil)
+	defer free_merge_children(got)
+	defer free_merge_warn(warn)
+	testing.expectf(t, len(got) == 2, "expected 2 children, got %v", len(got))
+	// Sorted by rel_path: b (bar) < vendor_a/tf2 (tf2) < vendor_b/tf2 (dropped).
+	testing.expectf(
+		t,
+		got[0].name == "bar" && got[0].rel_path == "b",
+		"got %q/%q",
+		got[0].name,
+		got[0].rel_path,
+	)
+	testing.expectf(
+		t,
+		got[1].name == "tf2" && got[1].rel_path == "vendor_a/tf2",
+		"expected lexicographically smallest rel_path to win, got %q/%q",
+		got[1].name,
+		got[1].rel_path,
+	)
+	testing.expectf(t, len(warn) > 0, "expected a name-dedup warning, got empty")
+}
+
+@(test)
+test_merge_name_dedup_two_resolver_lines :: proc(t: ^testing.T) {
+	// Two resolver lines share the same NAME at different rel_paths: keep the
+	// lexicographically smallest rel_path so no duplicate attr keys are emitted.
+	resolver := []core.Overlay_Child {
+		core.Overlay_Child{name = "ros", rel_path = "z/slow"},
+		core.Overlay_Child{name = "ros", rel_path = "a/fast"},
+		core.Overlay_Child{name = "pkg", rel_path = "m/pkg"},
+	}
+	got, warn := core.merge_children(nil, resolver)
+	defer free_merge_children(got)
+	defer free_merge_warn(warn)
+	testing.expectf(t, len(got) == 2, "expected 2 children, got %v", len(got))
+	// Sorted by rel_path: a/fast (ros) < m/pkg (pkg); z/slow (ros) is dropped.
+	testing.expectf(
+		t,
+		got[0].name == "ros" && got[0].rel_path == "a/fast",
+		"expected first resolver line's name to dedup to smallest rel, got %q/%q",
+		got[0].name,
+		got[0].rel_path,
+	)
+	testing.expectf(
+		t,
+		got[1].name == "pkg" && got[1].rel_path == "m/pkg",
+		"got %q/%q",
+		got[1].name,
+		got[1].rel_path,
+	)
+	testing.expectf(t, len(warn) > 0, "expected a name-dedup warning, got empty")
+}

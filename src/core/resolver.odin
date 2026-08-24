@@ -51,8 +51,10 @@ parse_resolver_lines :: proc(
 		}
 		if rel[0] == '/' {
 			// Not relative to the workspace root — hard error, fail closed.
+			// free_resolver_children releases the child strings AND the dynamic
+			// backing array (via `delete(children)` on the out[:] slice), so `out`
+			// must not be deleted a second time here.
 			free_resolver_children(out[:])
-			delete(out)
 			return nil, false
 		}
 		append(

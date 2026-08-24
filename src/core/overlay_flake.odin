@@ -193,12 +193,18 @@ generate_overlay_root_flake :: proc(
 			// .nws/packages/<name>.nix, it is called with callPackage against
 			// the spliced scope (so sibling-named dependencies resolve locally).
 			// Absence of the file falls through to the bare source build.
-			strings.write_string(&b, " = prev:\n        if builtins.pathExists ./.nws/packages/")
+			// Per-child user override hook: when the workspace has a hidden
+			// .nws/packages/<name>.nix, it is called with callPackage against
+			// the spliced scope (so sibling-named dependencies resolve locally).
+			// Absence of the file falls through to the bare source build.
+			// Paths are emitted as quoted Nix strings (nix_escape_string then
+			// handles spaces/"s/backslashes correctly).
+			strings.write_string(&b, " = prev:\n        if builtins.pathExists \"./.nws/packages/")
 			nix_escape_string(&b, c.name)
-			strings.write_string(&b, ".nix\n")
-			strings.write_string(&b, "        then prev.callPackage ./.nws/packages/")
+			strings.write_string(&b, ".nix\"\n")
+			strings.write_string(&b, "        then prev.callPackage \"./.nws/packages/")
 			nix_escape_string(&b, c.name)
-			strings.write_string(&b, ".nix { }\n")
+			strings.write_string(&b, ".nix\" { }\n")
 			// When the child name exists in the spliced overlay scope, src-override
 			// it: dependencies are inherited from the overlay rather than re-parsed.
 			strings.write_string(&b, "        else if (prev.")
@@ -206,9 +212,9 @@ generate_overlay_root_flake :: proc(
 			strings.write_string(&b, " or null) != null\n")
 			strings.write_string(&b, "        then prev.")
 			write_attr_key(&b, c.name)
-			strings.write_string(&b, ".overrideAttrs (final: { src = ./")
+			strings.write_string(&b, ".overrideAttrs (final: { src = \"./")
 			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, "; })\n")
+			strings.write_string(&b, "\"; })\n")
 			// Raw source checkouts (no default.nix) are built through the
 			// distro scope's buildRosPackage; plain callPackage remains as the
 			// fallback for scopes without it.
@@ -218,13 +224,13 @@ generate_overlay_root_flake :: proc(
 			nix_escape_string(&b, c.name)
 			strings.write_string(&b, "\";\n")
 			strings.write_string(&b, "          version = \"0.0.0\";\n")
-			strings.write_string(&b, "          src = ./")
+			strings.write_string(&b, "          src = \"./")
 			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, ";\n")
+			strings.write_string(&b, "\";\n")
 			strings.write_string(&b, "        }\n")
-			strings.write_string(&b, "        else prev.callPackage ./")
+			strings.write_string(&b, "        else prev.callPackage \"./")
 			nix_escape_string(&b, c.rel_path)
-			strings.write_string(&b, " { };\n")
+			strings.write_string(&b, "\" { };\n")
 		}
 		strings.write_string(&b, "    };\n")
 

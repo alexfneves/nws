@@ -51,29 +51,29 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
       else (overlayResolved0.rosPackages.humble or {});
     childCalls0 = {
       tf2 = prev:
-        if builtins.pathExists ./.nws/packages/tf2.nix
-        then prev.callPackage ./.nws/packages/tf2.nix { }
+        if builtins.pathExists "./.nws/packages/tf2.nix"
+        then prev.callPackage "./.nws/packages/tf2.nix" { }
         else if (prev.tf2 or null) != null
-        then prev.tf2.overrideAttrs (final: { src = ./tf2; })
+        then prev.tf2.overrideAttrs (final: { src = "./tf2"; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2";
           version = "0.0.0";
-          src = ./tf2;
+          src = "./tf2";
         }
-        else prev.callPackage ./tf2 { };
+        else prev.callPackage "./tf2" { };
       tf2_msgs = prev:
-        if builtins.pathExists ./.nws/packages/tf2_msgs.nix
-        then prev.callPackage ./.nws/packages/tf2_msgs.nix { }
+        if builtins.pathExists "./.nws/packages/tf2_msgs.nix"
+        then prev.callPackage "./.nws/packages/tf2_msgs.nix" { }
         else if (prev.tf2_msgs or null) != null
-        then prev.tf2_msgs.overrideAttrs (final: { src = ./ros/tf2_msgs; })
+        then prev.tf2_msgs.overrideAttrs (final: { src = "./ros/tf2_msgs"; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2_msgs";
           version = "0.0.0";
-          src = ./ros/tf2_msgs;
+          src = "./ros/tf2_msgs";
         }
-        else prev.callPackage ./ros/tf2_msgs { };
+        else prev.callPackage "./ros/tf2_msgs" { };
     };
     spliced0 =
       if (base0.overrideScope' or null) != null
@@ -165,10 +165,10 @@ test_overlay_flake_user_override_conditional :: proc(t: ^testing.T) {
 	defer delete(got)
 
 	want_block := `turtlebot3_msgs = prev:
-        if builtins.pathExists ./.nws/packages/turtlebot3_msgs.nix
-        then prev.callPackage ./.nws/packages/turtlebot3_msgs.nix { }
+        if builtins.pathExists "./.nws/packages/turtlebot3_msgs.nix"
+        then prev.callPackage "./.nws/packages/turtlebot3_msgs.nix" { }
         else if (prev.turtlebot3_msgs or null) != null
-        then prev.turtlebot3_msgs.overrideAttrs (final: { src = ./tb3/turtlebot3_msgs; })
+        then prev.turtlebot3_msgs.overrideAttrs (final: { src = "./tb3/turtlebot3_msgs"; })
         else if (prev.buildRosPackage or null) != null
 `
 	testing.expectf(
@@ -179,23 +179,50 @@ test_overlay_flake_user_override_conditional :: proc(t: ^testing.T) {
 	)
 }
 
-// Weird directory names are escaped correctly in attr keys and path strings.
+// Directory names with spaces, quotes, backslashes and ${ are escaped into
+// quoted Nix string literals at every path cite (pathExists override check,
+// src override, buildRosPackage src, and the bare callPackage fallback), so
+// the emitted flake stays syntactically valid for weird filesystem names.
 @(test)
 test_overlay_flake_weird_names_escaped :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
 	defer core.delete_workspace_config(cfg)
-	children := []core.Overlay_Child{{name = "my pkg", rel_path = "we\"ird/${dir}/my pkg"}}
+	// rel_path exercises every escape class nix_escape_string handles:
+	// a space, a double quote, a backslash and a ${ anti-quotation.
+	children := []core.Overlay_Child {
+		{name = "my pkg", rel_path = "spaced \"quoted\"/back\\slash/${dir}"},
+	}
 
 	got := core.generate_overlay_root_flake(children, cfg)
 	defer delete(got)
 
+	// The pathExists override check (child name) is a quoted string too.
 	testing.expect(
 		t,
-		strings.contains(got, `pname = "my pkg";`) &&
-		strings.contains(got, `prev.callPackage ./we\"ird/\${dir}/my pkg { };`),
-		"escaped splice lines missing in:\n%s",
+		strings.contains(got, `builtins.pathExists "./.nws/packages/my pkg.nix"`),
+		"quoted pathExists override missing in:\n%s",
 		got,
 	)
+	// src override and buildRosPackage src both quote + escape the rel_path.
+	testing.expect(
+		t,
+		strings.contains(got, `src = "./spaced \"quoted\"/back\\slash/\${dir}";`),
+		"quoted+escaped src cite missing in:\n%s",
+		got,
+	)
+	// The bare callPackage fallback quotes + escapes the rel_path.
+	testing.expect(
+		t,
+		strings.contains(
+			got,
+			`else prev.callPackage "./spaced \"quoted\"/back\\slash/\${dir}" { };`,
+		),
+		"quoted+escaped callPackage cite missing in:\n%s",
+		got,
+	)
+	// The attr key itself stays quoted (space in name) and pname is escaped.
+	testing.expect(t, strings.contains(got, `"my pkg" = prev:`), "quoted attr key missing")
+	testing.expect(t, strings.contains(got, `pname = "my pkg";`), "pname missing")
 }
 
 // Non-flake entry ("flake": false) emits the fetchTarball import form and
@@ -233,17 +260,17 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
       else (overlayResolved0.pkgs or {});
     childCalls0 = {
       foo = prev:
-        if builtins.pathExists ./.nws/packages/foo.nix
-        then prev.callPackage ./.nws/packages/foo.nix { }
+        if builtins.pathExists "./.nws/packages/foo.nix"
+        then prev.callPackage "./.nws/packages/foo.nix" { }
         else if (prev.foo or null) != null
-        then prev.foo.overrideAttrs (final: { src = ./foo; })
+        then prev.foo.overrideAttrs (final: { src = "./foo"; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "foo";
           version = "0.0.0";
-          src = ./foo;
+          src = "./foo";
         }
-        else prev.callPackage ./foo { };
+        else prev.callPackage "./foo" { };
     };
     spliced0 =
       if (base0.overrideScope' or null) != null

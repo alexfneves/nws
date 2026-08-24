@@ -18,7 +18,15 @@ import "core:strings"
 //      and a non-empty `warning` is returned for the caller to log. Duplicate
 //      Nix attr keys would hard-break eval, so the resolver is authoritative
 //      for the name→path binding.
-//   3. Final result is sorted deterministically by (rel_path, name). This
+//   3. Name-dedup within the survivors: two built-in dirs at different
+//      rel_paths can share a basename (vendor_a/tf2 vs vendor_b/tf2), and the
+//      resolver may emit two lines with the same NAME. Both would emit
+//      duplicate Nix attr keys and break eval, so each NAME is bound to at
+//      most one child: the one with the LEXICOGRAPHICALLY SMALLEST rel_path.
+//      This choice is deterministic regardless of input order or provenance
+//      (the builtin-vs-resolver precedence from step 2 is settled first).
+//      Dropped duplicates are recorded in `warning`.
+//   4. Final result is sorted deterministically by (rel_path, name). This
 //      mirrors the scan's own output order, so merging an already-sorted scan
 //      is stable; the generator independently re-sorts by (name, rel_path)
 //      internally, so provenance never surfaces in the emitted flake.
@@ -118,8 +126,62 @@ merge_children :: proc(
 		append(&compacted, c) // ownership moves from `out` to `compacted`
 	}
 
-	// ---- Step 3: deterministic sort by (rel_path, name). ----
-	slice.sort_by(compacted[:], proc(a, b: Overlay_Child) -> bool {
+	// ---- Step 3: name-dedup — every NAME resolves to at most one child. ----
+	// Two built-in dirs with the same basename at different rel_paths, or two
+	// resolver lines sharing a NAME, would emit duplicate Nix attr keys and
+	// hard-break eval. Keep the entry with the lexicographically smallest
+	// rel_path for each NAME (deterministic, independent of input order); the
+	// dropped duplicate is recorded in the warning. This pass runs after the
+	// resolver-wins compaction, so the resolver-vs-builtin precedence is
+	// already settled.
+	deduped := make([dynamic]Overlay_Child, 0, len(compacted), allocator)
+	defer delete(compacted)
+	for c in compacted { 	// ownership of c's strings resides in `compacted`
+		kept := -1 // index into deduped holding the same name, if any
+		for di in 0 ..< len(deduped) {
+			if deduped[di].name == c.name {
+				kept = di
+				break
+			}
+		}
+		if kept < 0 {
+			append(&deduped, c) // ownership moves from `compacted` to `deduped`
+		} else if c.rel_path < deduped[kept].rel_path {
+			// Newer occurrence sorts earlier — it wins; release the kept one.
+			if first_conflict {
+				strings.write_string(&warn, "duplicate child name")
+				first_conflict = false
+			} else {
+				strings.write_string(&warn, ", ")
+			}
+			strings.write_string(&warn, ": ")
+			strings.write_string(&warn, c.name)
+			strings.write_string(&warn, " (rel ")
+			strings.write_string(&warn, deduped[kept].rel_path)
+			strings.write_byte(&warn, ')')
+			delete(deduped[kept].name)
+			delete(deduped[kept].rel_path)
+			deduped[kept] = c
+		} else {
+			// Already-kept occurrence sorts earlier — the incoming is dropped.
+			if first_conflict {
+				strings.write_string(&warn, "duplicate child name")
+				first_conflict = false
+			} else {
+				strings.write_string(&warn, ", ")
+			}
+			strings.write_string(&warn, ": ")
+			strings.write_string(&warn, c.name)
+			strings.write_string(&warn, " (rel ")
+			strings.write_string(&warn, c.rel_path)
+			strings.write_byte(&warn, ')')
+			delete(c.name)
+			delete(c.rel_path)
+		}
+	}
+
+	// ---- Step 4: deterministic sort by (rel_path, name). ----
+	slice.sort_by(deduped[:], proc(a, b: Overlay_Child) -> bool {
 		if a.rel_path != b.rel_path {
 			return a.rel_path < b.rel_path
 		}
@@ -131,7 +193,7 @@ merge_children :: proc(
 	} else {
 		warning = strings.clone(strings.to_string(warn), allocator)
 	}
-	return compacted[:], warning
+	return deduped[:], warning
 }
 
 // _merge_has_rel reports whether `rel` already appears as a rel_path among

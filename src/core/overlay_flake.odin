@@ -199,6 +199,16 @@ generate_overlay_root_flake :: proc(
 			strings.write_string(&b, "        then prev.callPackage ./.nws/packages/")
 			nix_escape_string(&b, c.name)
 			strings.write_string(&b, ".nix { }\n")
+			// When the child name exists in the spliced overlay scope, src-override
+			// it: dependencies are inherited from the overlay rather than re-parsed.
+			strings.write_string(&b, "        else if (prev.")
+			write_attr_key(&b, c.name)
+			strings.write_string(&b, " or null) != null\n")
+			strings.write_string(&b, "        then prev.")
+			write_attr_key(&b, c.name)
+			strings.write_string(&b, ".overrideAttrs (final: { src = ./")
+			nix_escape_string(&b, c.rel_path)
+			strings.write_string(&b, "; })\n")
 			// Raw source checkouts (no default.nix) are built through the
 			// distro scope's buildRosPackage; plain callPackage remains as the
 			// fallback for scopes without it.
@@ -268,6 +278,18 @@ generate_overlay_root_flake :: proc(
 	strings.write_string(&b, "    packages.")
 	strings.write_string(&b, system_from_attr_path(first_ap))
 	strings.write_string(&b, " = {\n")
+	for c in sorted {
+		strings.write_string(&b, "      ")
+		write_attr_key(&b, c.name)
+		strings.write_string(&b, " = spliced0.")
+		write_attr_key(&b, c.name)
+		strings.write_string(&b, ";\n")
+	}
+	strings.write_string(&b, "    };\n")
+
+	// Convenience aggregated output: default = { <name> = spliced0.<name>; ... }
+	// so a bare `nix build` builds the substitution set.
+	strings.write_string(&b, "    default = {\n")
 	for c in sorted {
 		strings.write_string(&b, "      ")
 		write_attr_key(&b, c.name)

@@ -53,6 +53,8 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
       tf2 = prev:
         if builtins.pathExists ./.nws/packages/tf2.nix
         then prev.callPackage ./.nws/packages/tf2.nix { }
+        else if (prev.tf2 or null) != null
+        then prev.tf2.overrideAttrs (final: { src = ./tf2; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2";
@@ -63,6 +65,8 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
       tf2_msgs = prev:
         if builtins.pathExists ./.nws/packages/tf2_msgs.nix
         then prev.callPackage ./.nws/packages/tf2_msgs.nix { }
+        else if (prev.tf2_msgs or null) != null
+        then prev.tf2_msgs.overrideAttrs (final: { src = ./ros/tf2_msgs; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2_msgs";
@@ -79,6 +83,10 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
   {
     rosPackages.humble = spliced0;
     packages.x86_64-linux = {
+      tf2 = spliced0.tf2;
+      tf2_msgs = spliced0.tf2_msgs;
+    };
+    default = {
       tf2 = spliced0.tf2;
       tf2_msgs = spliced0.tf2_msgs;
     };
@@ -159,6 +167,8 @@ test_overlay_flake_user_override_conditional :: proc(t: ^testing.T) {
 	want_block := `turtlebot3_msgs = prev:
         if builtins.pathExists ./.nws/packages/turtlebot3_msgs.nix
         then prev.callPackage ./.nws/packages/turtlebot3_msgs.nix { }
+        else if (prev.turtlebot3_msgs or null) != null
+        then prev.turtlebot3_msgs.overrideAttrs (final: { src = ./tb3/turtlebot3_msgs; })
         else if (prev.buildRosPackage or null) != null
 `
 	testing.expectf(
@@ -225,6 +235,8 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
       foo = prev:
         if builtins.pathExists ./.nws/packages/foo.nix
         then prev.callPackage ./.nws/packages/foo.nix { }
+        else if (prev.foo or null) != null
+        then prev.foo.overrideAttrs (final: { src = ./foo; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "foo";
@@ -241,6 +253,9 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
   {
     pkgs = spliced0;
     packages.x86_64-linux = {
+      foo = spliced0.foo;
+    };
+    default = {
       foo = spliced0.foo;
     };
   };
@@ -367,6 +382,37 @@ test_overlay_flake_packages_system_from_attrpath :: proc(t: ^testing.T) {
 		got,
 	)
 	testing.expect(t, strings.contains(got, "      foo = spliced0.foo;"), "packages entry missing")
+}
+
+// default output aggregates every substituted child for a bare build.
+@(test)
+test_overlay_flake_default_output :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child {
+		{name = "tf2", rel_path = "tf2"},
+		{name = "tf2_msgs", rel_path = "ros/tf2_msgs"},
+	}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	testing.expect(
+		t,
+		strings.contains(got, "    default = {\n"),
+		"default output missing:\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "      tf2 = spliced0.tf2;\n"),
+		"default tf2 entry missing",
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "      tf2_msgs = spliced0.tf2_msgs;\n"),
+		"default tf2_msgs missing",
+	)
 }
 
 // Cascade branch 3: non-flake entry → no inputs section; base comes from

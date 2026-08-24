@@ -302,18 +302,31 @@ generate_overlay_root_flake :: proc(
 		write_attr_key(&b, c.name)
 		strings.write_string(&b, ";\n")
 	}
-	strings.write_string(&b, "    };\n")
 
-	// Convenience aggregated output: default = { <name> = spliced0.<name>; ... }
-	// so a bare `nix build` builds the substitution set.
-	strings.write_string(&b, "    default = {\n")
+	// Bare `nix build` requires packages.<system>.default to be a DERIVATION
+	// (Nix rejects an attrset there: "expected a derivation or path but found
+	// a set"). Aggregate all spliced children with a nixpkgs buildEnv so a
+	// bare `nix build` installs the whole substitution set. The nixpkgs input
+	// is present via the cascade chain (nixpkgs.follows) or an explicit
+	// nixpkgs.url; when neither exists (all non-flake overlays) fall back to
+	// the first child so the attribute remains a valid derivation.
+	sys := system_from_attr_path(first_ap)
+	strings.write_string(&b, "      default = (if builtins.hasAttr \"nixpkgs\" inputs then\n")
+	strings.write_string(&b, "        (import inputs.nixpkgs { system = \"")
+	strings.write_string(&b, sys)
+	strings.write_string(&b, "\"; }).buildEnv {\n")
+	strings.write_string(&b, "          name = \"nws-workspace-env\";\n")
+	strings.write_string(&b, "          paths = [\n")
 	for c in emit {
-		strings.write_string(&b, "      ")
+		strings.write_string(&b, "            spliced0.")
 		write_attr_key(&b, c.name)
-		strings.write_string(&b, " = spliced0.")
-		write_attr_key(&b, c.name)
-		strings.write_string(&b, ";\n")
+		strings.write_string(&b, "\n")
 	}
+	strings.write_string(&b, "          ];\n")
+	strings.write_string(&b, "        }\n")
+	strings.write_string(&b, "      else spliced0.")
+	write_attr_key(&b, emit[0].name)
+	strings.write_string(&b, ";\n")
 	strings.write_string(&b, "    };\n")
 
 	strings.write_string(&b, "  };\n}\n")

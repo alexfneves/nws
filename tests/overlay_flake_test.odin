@@ -85,10 +85,15 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
     packages.x86_64-linux = {
       tf2 = spliced0.tf2;
       tf2_msgs = spliced0.tf2_msgs;
-    };
-    default = {
-      tf2 = spliced0.tf2;
-      tf2_msgs = spliced0.tf2_msgs;
+      default = (if builtins.hasAttr "nixpkgs" inputs then
+        (import inputs.nixpkgs { system = "x86_64-linux"; }).buildEnv {
+          name = "nws-workspace-env";
+          paths = [
+            spliced0.tf2
+            spliced0.tf2_msgs
+          ];
+        }
+      else spliced0.tf2;
     };
   };
 }
@@ -275,9 +280,14 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
     pkgs = spliced0;
     packages.x86_64-linux = {
       foo = spliced0.foo;
-    };
-    default = {
-      foo = spliced0.foo;
+      default = (if builtins.hasAttr "nixpkgs" inputs then
+        (import inputs.nixpkgs { system = "x86_64-linux"; }).buildEnv {
+          name = "nws-workspace-env";
+          paths = [
+            spliced0.foo
+          ];
+        }
+      else spliced0.foo;
     };
   };
 }
@@ -420,19 +430,16 @@ test_overlay_flake_default_output :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		strings.contains(got, "    default = {\n"),
-		"default output missing:\n%s",
+		strings.contains(got, "default = (if builtins.hasAttr \"nixpkgs\" inputs then\n"),
+		"buildEnv default output missing:\n%s",
 		got,
 	)
+	testing.expect(t, strings.contains(got, "nws-workspace-env"), "buildEnv name missing")
+	testing.expect(t, strings.contains(got, "spliced0.tf2\n"), "default tf2 path entry missing")
 	testing.expect(
 		t,
-		strings.contains(got, "      tf2 = spliced0.tf2;\n"),
-		"default tf2 entry missing",
-	)
-	testing.expect(
-		t,
-		strings.contains(got, "      tf2_msgs = spliced0.tf2_msgs;\n"),
-		"default tf2_msgs missing",
+		strings.contains(got, "spliced0.tf2_msgs\n"),
+		"default tf2_msgs path entry missing",
 	)
 }
 

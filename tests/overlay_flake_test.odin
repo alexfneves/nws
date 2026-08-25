@@ -93,7 +93,7 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
             spliced0.tf2_msgs
           ];
         }
-      else spliced0.tf2;
+      else spliced0.tf2);
     };
   };
 }
@@ -287,7 +287,7 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
             spliced0.foo
           ];
         }
-      else spliced0.foo;
+      else spliced0.foo);
     };
   };
 }

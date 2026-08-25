@@ -326,7 +326,7 @@ generate_overlay_root_flake :: proc(
 	strings.write_string(&b, "        }\n")
 	strings.write_string(&b, "      else spliced0.")
 	write_attr_key(&b, emit[0].name)
-	strings.write_string(&b, ";\n")
+	strings.write_string(&b, ");\n")
 	strings.write_string(&b, "    };\n")
 
 	strings.write_string(&b, "  };\n}\n")

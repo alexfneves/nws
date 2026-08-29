@@ -938,9 +938,12 @@ atomic_write :: proc(path, text: string, logging: bool, what: string) -> bool {
 // set of first-level children. Children are never modified: their flakes are
 // only read (via their .git/config for the canonical URL). Write policy:
 //
-//   - no root flake        → create the generated one
-//   - nws-managed root     → atomic-write only when bytes differ
-//   - user-authored root   → log and never touch
+//   - no root flake        → create a minimal file wrapping the generated block
+//   - root with nws block  → the marked region is replaced; user bytes outside
+//     the markers are never touched
+//   - user-authored root   → the block is injected before the final closing `}`
+//   - unparseable root     → log and never touch
+//   - patched bytes equal  → skip the write (no self-trigger loop)
 sync_workspace :: proc(state: ^Daemon_State, path: string) {
 	// Backend dispatch: overlay workspaces take a completely separate pipeline
 	// (no state.json, no .git probing, no sibling deps).
@@ -1077,26 +1080,32 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 		}
 	}
 
-	generated := core.generate_root_flake(children[:])
-	defer delete(generated)
+	block := core.generate_root_block(children[:])
+	defer delete(block)
 
 	existing, rerr := os.read_entire_file(fl_path, context.allocator)
 	if rerr != nil {
-		// No root flake yet: create the generated one on this event.
-		atomic_write(fl_path, generated, state.logging, "generated")
+		// No root flake yet: create a minimal file wrapping the block.
+		new_text, ok := core.patch_flake("", block)
+		if ok && len(new_text) > 0 {
+			atomic_write(fl_path, new_text, state.logging, "generated")
+		}
+		delete(new_text)
 		return
 	}
 	defer delete(existing)
 
-	if !core.is_managed_root(string(existing)) {
-		log_line(state.logging, "skipping user-authored %s", fl_path)
+	new_text, ok := core.patch_flake(string(existing), block)
+	if !ok {
+		log_line(state.logging, "leaving flake alone (unparseable): %s", fl_path)
 		return
 	}
+	defer delete(new_text)
 
-	if string(existing) == generated {
-		return // byte-identical: no write, so no self-trigger loop
+	if string(existing) == new_text {
+		return // loop guard on PATCHED result
 	}
-	atomic_write(fl_path, generated, state.logging, "regenerated")
+	atomic_write(fl_path, new_text, state.logging, "regenerated")
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,8 +1117,8 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 // external resolver subprocess (core.run_resolver) both produce
 // Overlay_Child sets; core.merge_children unions/dedups them (resolver wins
 // on same-name/different-rel_path collisions — logged), and
-// core.generate_overlay_root_flake splices the result under the shared write
-// policy (managed-root gate + byte-equal skip). Overlay discovery is purely
+// core.generate_overlay_block splices the result under the shared write
+// policy (create-or-patch + patched-byte skip). Overlay discovery is purely
 // scan+resolver: no `nix eval` shell-out remains (ISC-A-1). Both producers
 // are fail-open — an unreadable scan dir, a depth/count cap, a failing
 // resolver or a malformed resolver line never prevents a regenerated managed
@@ -1154,25 +1163,33 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 		log_line(state.logging, "warning: %s", merge_warn)
 	}
 
-	generated := core.generate_overlay_root_flake(matched, cfg)
-	defer delete(generated)
+	block := core.generate_overlay_block(matched, cfg)
+	defer delete(block)
 
-	// Shared write policy (same as the flake backend).
+	// Shared write policy (same as the flake backend): create-or-patch + byte-skip.
 	existing, rerr := os.read_entire_file(fl_path, context.allocator)
 	if rerr != nil {
-		atomic_write(fl_path, generated, state.logging, "generated")
+		// No root flake yet: create a minimal file wrapping the block.
+		new_text, ok := core.patch_flake("", block)
+		if ok && len(new_text) > 0 {
+			atomic_write(fl_path, new_text, state.logging, "generated")
+		}
+		delete(new_text)
 		return
 	}
 	defer delete(existing)
 
-	if !core.is_managed_root(string(existing)) {
-		log_line(state.logging, "skipping user-authored %s", fl_path)
+	new_text, ok := core.patch_flake(string(existing), block)
+	if !ok {
+		log_line(state.logging, "leaving flake alone (unparseable): %s", fl_path)
 		return
 	}
-	if string(existing) == generated {
-		return // byte-identical: no write, so no self-trigger loop
+	defer delete(new_text)
+
+	if string(existing) == new_text {
+		return // loop guard on PATCHED result
 	}
-	atomic_write(fl_path, generated, state.logging, "regenerated")
+	atomic_write(fl_path, new_text, state.logging, "regenerated")
 }
 
 // read_dir_adapter wires the scanner's Dir_Listing_Proc seam to the real

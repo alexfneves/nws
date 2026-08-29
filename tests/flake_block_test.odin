@@ -187,11 +187,12 @@ test_patch_flake_update :: proc(t: ^testing.T) {
 }
 
 // Unparseable text (no top-level `{ ... }` boundary) → unchanged + false.
+// (The empty/whitespace-only case is the CREATE path — see
+// test_patch_flake_create.)
 @(test)
 test_patch_flake_unparseable :: proc(t: ^testing.T) {
 	block := core.NWS_BLOCK_BEGIN + "\n" + core.NWS_BLOCK_END + "\n"
 	cases := []string {
-		"",
 		"no braces at all\n",
 		"nixpkgs.url = \"github:nixos/nixpkgs\";\n",
 		"{\n  inputs = { };\n", // opener without a top-level closer
@@ -222,6 +223,97 @@ test_patch_flake_empty_block :: proc(t: ^testing.T) {
 	defer delete(again)
 	testing.expectf(t, ok2, "empty-block update must succeed")
 	testing.expectf(t, again == got, "identical block update must be a byte no-op")
+}
+
+// Create path: an empty or whitespace-only existing file is not a flake to
+// patch — patch_flake wraps the block in a fresh minimal `{ ... }` scaffold
+// (the daemon's no-flake path). The result must round-trip: repatching with
+// the same block is a byte no-op, which is what prevents the self-trigger
+// loop on a freshly created file.
+@(test)
+test_patch_flake_create :: proc(t: ^testing.T) {
+	block := core.NWS_BLOCK_BEGIN + "\n  inputs = { };\n" + core.NWS_BLOCK_END + "\n"
+	want := strings.concatenate({"{\n", block, "}\n"})
+	defer delete(want)
+
+	inputs := []string{"", "  \n\t\n", "\n\n"}
+	for text in inputs {
+		got, ok := core.patch_flake(text, block)
+		defer delete(got)
+		testing.expectf(t, ok, "create must succeed for %q", text)
+		testing.expectf(
+			t,
+			got == want,
+			"create mismatch for %q:\n--- got ---\n%s\n--- want ---\n%s",
+			text,
+			got,
+			want,
+		)
+		testing.expectf(t, strings.contains(got, block), "block must be preserved verbatim")
+
+		roundtrip, ok2 := core.patch_flake(got, block)
+		defer delete(roundtrip)
+		testing.expectf(t, ok2, "round-trip update must succeed")
+		testing.expectf(
+			t,
+			roundtrip == got,
+			"created flake must be patch-stable (loop guard)\n--- got ---\n%s\n--- twice ---\n%s",
+			got,
+			roundtrip,
+		)
+	}
+}
+
+// Daemon lifecycle (T3): an absent flake is created wrapping the block; a
+// user devShell added outside the markers survives regeneration while the
+// block updates in place; repatching is a byte no-op (loop guard).
+@(test)
+test_patch_flake_daemon_lifecycle :: proc(t: ^testing.T) {
+	block_v1 := core.NWS_BLOCK_BEGIN + "\n  inputs = { };\n" + core.NWS_BLOCK_END + "\n"
+
+	// 1. Create path — no flake yet.
+	created, ok1 := core.patch_flake("", block_v1)
+	defer delete(created)
+	testing.expectf(t, ok1, "create must succeed")
+	testing.expectf(
+		t,
+		strings.has_prefix(created, "{\n" + core.NWS_BLOCK_BEGIN + "\n"),
+		"created flake must wrap the block",
+	)
+	testing.expectf(t, strings.has_suffix(created, "}\n"), "created flake must close braces")
+
+	// 2. User adds a devShell between the block and the closing brace.
+	user_flake := strings.concatenate(
+		{"{\n", block_v1, "  devShells.x86_64-linux.default = pkgs.mkShell { };\n}\n"},
+	)
+	defer delete(user_flake)
+
+	// 3. Regeneration with a changed block — the user devShell must survive.
+	block_v2 :=
+		core.NWS_BLOCK_BEGIN +
+		"\n  inputs = { nixpkgs.url = \"github:nixos/nixpkgs\"; };\n" +
+		core.NWS_BLOCK_END +
+		"\n"
+	patched, ok2 := core.patch_flake(user_flake, block_v2)
+	defer delete(patched)
+	testing.expectf(t, ok2, "update must succeed")
+	testing.expectf(t, strings.contains(patched, block_v2), "block must update to v2")
+	testing.expectf(
+		t,
+		strings.contains(patched, "devShells.x86_64-linux.default = pkgs.mkShell { };"),
+		"user devShell must survive regeneration",
+	)
+	testing.expectf(
+		t,
+		strings.count(patched, core.NWS_BLOCK_BEGIN) == 1,
+		"exactly one nws block must remain",
+	)
+
+	// 4. Loop guard: repatching with the same block is a byte no-op.
+	again, ok3 := core.patch_flake(patched, block_v2)
+	defer delete(again)
+	testing.expectf(t, ok3, "idempotent update must succeed")
+	testing.expectf(t, again == patched, "identical patch must be a byte no-op")
 }
 
 // Determinism: patching the same inputs twice yields the same bytes.

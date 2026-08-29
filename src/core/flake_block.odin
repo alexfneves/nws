@@ -73,6 +73,9 @@ has_nws_block :: proc(text: string) -> bool {
 //   - no block present → the block is injected before the last top-level
 //     closing `}` (the flake's outer scope): `before + "\n" + block + "\n" +
 //     "\n" + closer`; every existing byte is preserved.
+//   - empty/whitespace-only existing (no flake at all) → a fresh minimal
+//     flake wrapping the block: "{\n" + block + "}\n" — the daemon's
+//     create path.
 //
 // ok is false — and existing is returned unchanged — when no safe injection
 // point exists (no top-level `{ ... }` boundary), so an unparseable user file
@@ -85,6 +88,19 @@ patch_flake :: proc(existing, block: string) -> (string, bool) {
 		strings.write_string(&b, existing[:start])
 		strings.write_string(&b, block)
 		strings.write_string(&b, existing[end:])
+		return strings.clone(strings.to_string(b), context.allocator), true
+	}
+
+	// Create path: an empty or whitespace-only file is not a flake to patch —
+	// wrap the block in a minimal fresh top-level `{ ... }` scaffold so the
+	// result is a valid flake.nix the user may then extend. The block carries
+	// its own trailing newline after the END marker, so `}` lands on its own.
+	if len(strings.trim_space(existing)) == 0 {
+		b := strings.builder_make(context.allocator)
+		defer strings.builder_destroy(&b)
+		strings.write_string(&b, "{\n")
+		strings.write_string(&b, block)
+		strings.write_string(&b, "}\n")
 		return strings.clone(strings.to_string(b), context.allocator), true
 	}
 

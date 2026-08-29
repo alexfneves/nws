@@ -120,12 +120,20 @@ SYS="x86_64-linux"
 
 build_devshell_block() {
   local mark="$1" sys="$2"
-  # collect spliced child names from the generated childCalls0 attrset
-  local children=""
-  local c
-  while IFS= read -r c; do
-    children+="          spliced0.${c}"$'\n'
-  done < <(grep -oE '^      [A-Za-z0-9_+-]+ = prev:' "$WS/flake.nix" | awk '{print $1}' | sort -u)
+  # Dev shell = ROS tooling (ros-base buildEnv: roscore/roslaunch/rosrun) + the
+  # workspace's LOCAL SOURCE dirs on ROS_PACKAGE_PATH. Pointing ROS_PACKAGE_PATH
+  # at the source trees (rather than at built derivations) is what makes
+  # rosrun/roslaunch find your local packages — WITHOUT forcing every bare
+  # spliced child to build (some monorepo subpackages have no declared deps,
+  # so a full derivation build can fail; source pathing avoids that entirely).
+  local srcs=""
+  # every package.xml dir under the workspace — find yields ABSOLUTE paths;
+  # bake the package dirs into ROS_PACKAGE_PATH at inject time (the shellHook
+  # runs later with no $WS available). Build a colon-joined quoted list.
+  local d
+  while IFS= read -r d; do
+    srcs+=":\"${d%/*}\""
+  done < <(find "$WS" -name package.xml -type f 2>/dev/null | sort -u)
 
   cat <<EOF
     $mark
@@ -133,15 +141,13 @@ build_devshell_block() {
       pkgsN = import inputs.nixpkgs { system = "$sys"; };
       env = spliced0.buildEnv {
         name = "nws-dev-env";
-        paths = [ spliced0.ros-core ] ++ (builtins.filter (x: x != null) [
-$children
-        ]);
+        paths = [ spliced0.ros-base ];
       };
     in pkgsN.mkShell {
       buildInputs = [ env ];
       shellHook = ''
         export ROS_MASTER_URI=http://localhost:11311
-        export ROS_PACKAGE_PATH="\${env}/share/ros"''\${ROS_PACKAGE_PATH:+:\$ROS_PACKAGE_PATH}
+        export ROS_PACKAGE_PATH="\${env}/share/ros${srcs}"
         echo "ROS dev shell ready: rosrun/roslaunch"
       '';
     };
@@ -153,30 +159,60 @@ inject_devshell() {
   [ -f "$f" ] || return 1
   local block
   block="$(build_devshell_block "$DEV_MARK" "$SYS")"
-  # replace-idempotent: strip any existing user devShell block (marked or
-  # stray), then insert the fresh one before the LAST closing "  };" of the
-  # outputs attrset. nws regenerates a CLEAN flake on each fs event, so on a
-  # fresh workspace there is none; this guards reused/dirty workspaces.
+  # replace-idempotent: strip ANY existing devShell output block (marked or
+  # stale — including old `//`-shaped ones) by deleting every line from a
+  # `devShells.` attribute through its matching closing brace, then insert the
+  # fresh block before the LAST closing "  };" of the outputs attrset.
   python3 - "$f" "$block" <<'PYEOF'
 import re, sys
 f, block = sys.argv[1], sys.argv[2]
 s = open(f).read()
-# drop any existing devShells.<sys>.default ... ; block (balanced by two-space close)
-s = re.sub(r"    devShells\.[A-Za-z0-9_-]+\.default = let\n.*?\n    };\n", "", s, flags=re.S)
+# remove any existing devShells.<sys>.default = ... ; block (balanced)
+lines = s.split("\n")
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if re.match(r"^    devShells\.[A-Za-z0-9_-]+\.default =", line):
+        depth = 0
+        start = i
+        # consume through the matching "    };" at the same nesting as "default = let"
+        while i < len(lines):
+            depth += lines[i].count("{") - lines[i].count("}")
+            if depth <= 0 and re.match(r"^    };", lines[i]):
+                break
+            i += 1
+        i += 1  # skip the closing line too
+        continue
+    out.append(line)
+    i += 1
+s = "\n".join(out) + "\n"
 # insert block before the LAST 2-space closing line of outputs ("  };\n}")
-i = s.rfind("  };\n}")
-if i < 0:
+idx = s.rfind("  };\n}")
+if idx < 0:
     print("ANCHOR MISSING", file=sys.stderr); sys.exit(1)
-s = s[:i] + block + "\n" + s[i:]
+s = s[:idx] + block + "\n" + s[idx:]
 open(f, "w").write(s)
 PYEOF
+}
+
+# after injecting, assert the flake has exactly one devShell with the ++ shape
+assert_devshell_ok() {
+  local n b
+  n=$(grep -c 'devShells.x86_64-linux.default' "$WS/flake.nix" || true)
+  b=$(grep -c 'paths = \[ spliced0.ros-base \];' "$WS/flake.nix" || true)
+  if [ "$n" != "1" ] || [ "$b" != "1" ]; then
+    echo "WARN: devShell inject assertion failed (found devShell=$n, ros-base-shape=$b)"
+    return 1
+  fi
+  return 0
 }
 
 # inject, retrying until the flake is stable (daemon may still be settling
 # regens and briefly write the minimal {} form which has no anchor)
 for _t in $(seq 1 10); do
   inject_devshell
-  grep -qF "$DEV_MARK" "$WS/flake.nix" && { INJ_OK=1; break; }
+  assert_devshell_ok && { INJ_OK=1; break; }
   sleep 1
 done
 if [ "${INJ_OK:-0}" != "1" ]; then

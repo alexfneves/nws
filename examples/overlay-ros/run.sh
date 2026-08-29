@@ -149,15 +149,24 @@ EOSRC
   cat <<EOF
     $mark
     devShells.$sys.default = let
-      pkgsN = import inputs.nixpkgs { system = "$sys"; };
-      env = spliced0.buildEnv {
+      # nixpkgs imported WITH the gazebo/freeimage insecurity gate lifted:
+      # the gazebo stack transitively needs the insecure `freeimage`, which
+      # nixpkgs refuses by default. We allow exactly it (and its known CVEs)
+      # here so the simulation can actually evaluate.
+      pkgsN = import inputs.nixpkgs {
+        system = "$sys";
+        config.permittedInsecurePackages = [
+          "freeimage-3.18.0-unstable-2024-04-18"
+        ];
+      };
+      env = pkgsN.buildEnv {
         name = "nws-dev-env";
         paths = [
           spliced0.ros-base
-          spliced0.gazebo
-          spliced0.gazebo-ros
-          spliced0.xacro
-          spliced0.robot-state-publisher
+          pkgsN.gazebo
+          pkgsN.gazebo-ros
+          pkgsN.xacro
+          pkgsN.robot-state-publisher
           spliced0.turtlebot3-gazebo
           spliced0.turtlebot3-description
           spliced0.turtlebot3

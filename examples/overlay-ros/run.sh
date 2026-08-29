@@ -32,11 +32,17 @@ WS="/tmp/nws_example_overlay_ws"
 DAEMON_LOG="/tmp/nws_example_overlay_daemon.log"
 
 clean() {
+  # disarm INT/TERM/EXIT while clean runs so a Ctrl+C during cleanup does not
+  # re-trigger the trap (which caused an endless cascade of clean() calls).
+  trap - INT TERM EXIT
   set +e
   echo "==> cleaning up (unregister + stop daemon + rm workspace)"
   "$NWS" unregister "$WS" </dev/null >/dev/null 2>&1
   pkill -f "$NWS service" 2>/dev/null
   rm -rf "$WS"
+  # make sure the daemon child really dies even if we were mid-clone
+  pkill -f "$NWS service" 2>/dev/null
+  exit 0
 }
 trap clean EXIT INT TERM
 

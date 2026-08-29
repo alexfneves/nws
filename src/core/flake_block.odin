@@ -83,8 +83,10 @@ has_nws_block :: proc(text: string) -> bool {
 //     and `}` closers) is byte-preserved across regenerations — this is
 //     where user devShells/apps live and survive.
 //   - no block present → the block is injected before the last top-level
-//     closing `}` (the flake's outer scope): `before + "\n" + block + "\n" +
-//     "\n" + closer`; every existing byte is preserved. A file that already
+//     closing `}` (the flake's outer scope), first closing the outputs return
+//     set the block leaves open at its END marker with `  };` (mirroring the
+//     create scaffold): `before + "\n" + block + "  };\n" + closer`. Every
+//     existing byte is preserved. A file that already
 //     declares top-level `inputs`/`outputs` of its own is refused (fail-open,
 //     unchanged): the block defines both attributes, so injecting would
 //     produce duplicate-attribute evaluation errors and break the file.
@@ -119,10 +121,12 @@ patch_flake :: proc(existing, block: string) -> (string, bool) {
 		// scaffold appends the return set's closer `  };` before the flake's
 		// `}`. The result is a valid flake.nix the user may then extend below
 		// the END marker.
+		block_normalized := normalize_block_end(block)
+		defer delete(block_normalized)
 		b := strings.builder_make(context.allocator)
 		defer strings.builder_destroy(&b)
 		strings.write_string(&b, "{\n")
-		strings.write_string(&b, block)
+		strings.write_string(&b, block_normalized)
 		strings.write_string(&b, "  };\n}\n")
 		return strings.clone(strings.to_string(b), context.allocator), true
 	}
@@ -140,49 +144,131 @@ patch_flake :: proc(existing, block: string) -> (string, bool) {
 	if pos == -1 {
 		return existing, false
 	}
+	// The block leaves the outputs return set open at its END marker (see the
+	// file-top contract), so before the file's own final `}` we additionally
+	// emit the return set's closer `  };` — exactly what the create scaffold
+	// does. The file's `}` then closes the outer scope, so the result is
+	// `before + block + "  };\n" + closer`, brace-balanced for every
+	// generator block. Without the closer, the file's `}` would collapse the
+	// return set and leave the file's own outer `{ ... }` unclosed
+	// (unparseable).
+	block_normalized := normalize_block_end(block)
+	defer delete(block_normalized)
+
 	b := strings.builder_make(context.allocator)
 	defer strings.builder_destroy(&b)
 	strings.write_string(&b, existing[:pos])
 	strings.write_string(&b, "\n")
-	strings.write_string(&b, block)
-	strings.write_string(&b, "\n")
-	strings.write_string(&b, "\n")
+	strings.write_string(&b, block_normalized)
+	strings.write_string(&b, "  };\n")
 	strings.write_string(&b, existing[pos:])
 	return strings.clone(strings.to_string(b), context.allocator), true
+}
+
+// normalize_block_end returns a copy of block guaranteed to end in exactly
+// one '\n' (trailing '\r'/'\n' runs collapsed), so the return-set closer and
+// the flake's closing brace always land on their own lines regardless of how
+// the caller formed the block. Generator output already has this shape (END
+// marker + '\n'); the normalisation only hardens the create/inject paths'
+// layout guarantee. The returned string is allocated from allocator and
+// owned by the caller.
+normalize_block_end :: proc(block: string, allocator := context.allocator) -> string {
+	trimmed := strings.trim_right(block, "\r\n")
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, trimmed)
+	strings.write_string(&b, "\n")
+	return strings.clone(strings.to_string(b), allocator)
 }
 
 // has_own_top_level_io reports whether text declares an `inputs` or
 // `outputs` attribute of its own directly inside the flake's outer `{ ... }`
 // shell (brace depth 1 — the level the nws block occupies). Both the
 // attrset form (`inputs = { ... }`, `outputs = { self }: ...`) and the
-// dotted form (`inputs.<name>.url = ...`) are recognised. Strings, comments,
-// and the `${ ... }` contents of indented strings are skipped so prose or
-// descriptions cannot trip it; anything ambiguous is treated as a hit — the
-// caller refuses to inject (fail-open), which is always safe: the worst case
-// is a file left alone, never a duplicate-attribute flake.
+// dotted form (`inputs.<name>.url = ...`) are recognised. Scanning is
+// literal-aware (see scan_tokens): braces and identifiers inside strings,
+// indented strings and comments are inert, so prose cannot trip it. Only
+// UNQUOTED `inputs`/`outputs` identifiers count as the collision — a quoted
+// key like `"inputs" = ...` is string content, not a declaration the lexer
+// matches. Anything ambiguous is treated as a hit — the caller refuses to
+// inject (fail-open), which is always safe: the worst case is a file left
+// alone, never a duplicate-attribute flake.
 has_own_top_level_io :: proc(text: string) -> bool {
+	tokens := scan_tokens(text, context.allocator)
+	defer delete(tokens)
 	depth := 0
+	for tok in tokens {
+		if tok.kind != .Code {
+			continue
+		}
+		for i := tok.start; i < tok.end; {
+			c := text[i]
+			switch {
+			case c == '{':
+				depth += 1
+				i += 1
+			case c == '}':
+				if depth > 0 {
+					depth -= 1
+				}
+				i += 1
+			case depth == 1 && ident_start_byte(c):
+				j := i
+				for j < tok.end && ident_cont_byte(text[j]) {
+					j += 1
+				}
+				if text[i:j] == "inputs" || text[i:j] == "outputs" {
+					return true
+				}
+				i = j
+			case:
+				i += 1
+			}
+		}
+	}
+	return false
+}
+
+// scan_tokens splits text into runs of CODE (unlexed Nix source) and LITERAL
+// content (double-quoted strings, indented strings, `#` comments). Only CODE
+// carries structure: braces and identifiers inside literal runs are inert.
+// Literal rules match Nix closely enough for flake.nix anatomy:
+//
+//   - `#` … end of line        → comment;
+//   - `"` … next unescaped `"` → double-quoted string;
+//   - `''` … next `''`         → indented string;
+//   - anything else            → code.
+//
+// `${ ... }` interpolation inside strings is skipped wholesale with the
+// string, so a `}` inside it can never be mistaken for structure. An
+// unterminated literal is consumed to the end of its line — conservative:
+// its braces stay inert, which never crashes and only ever errs toward a
+// refusal to patch. The returned slice is allocated from allocator and owned
+// by the caller.
+scan_tokens :: proc(text: string, allocator := context.allocator) -> [dynamic]Scan_Token {
+	tokens := make([dynamic]Scan_Token, 0, 16, allocator)
 	i := 0
 	n := len(text)
+	code_start := 0
 	for i < n {
 		c := text[i]
 		switch {
-		case c == '{':
-			depth += 1
-			i += 1
-		case c == '}':
-			if depth > 0 {
-				depth -= 1
-			}
-			i += 1
 		case c == '#':
-			// Comment: skip to end of line.
-			for i < n && text[i] != '\n' {
-				i += 1
+			if code_start < i {
+				append(&tokens, Scan_Token{start = code_start, end = i, kind = .Code})
 			}
+			j := i
+			for j < n && text[j] != '\n' {
+				j += 1
+			}
+			append(&tokens, Scan_Token{start = i, end = j, kind = .Comment})
+			i = j
+			code_start = i
 		case c == '"':
-			// Double-quoted string: skip to the closing quote, honouring
-			// backslash escapes; an unterminated line bails conservatively.
+			if code_start < i {
+				append(&tokens, Scan_Token{start = code_start, end = i, kind = .Code})
+			}
+			start := i
 			i += 1
 			for i < n && text[i] != '\n' {
 				if text[i] == '\\' {
@@ -194,27 +280,78 @@ has_own_top_level_io :: proc(text: string) -> bool {
 					i += 1
 				}
 			}
+			append(&tokens, Scan_Token{start = start, end = i, kind = .String})
+			code_start = i
 		case c == '\'' && i + 1 < n && text[i + 1] == '\'':
-			// Indented string: skip to the closing `''`.
+			if code_start < i {
+				append(&tokens, Scan_Token{start = code_start, end = i, kind = .Code})
+			}
+			start := i
 			i += 2
 			for i + 1 < n && !(text[i] == '\'' && text[i + 1] == '\'') {
 				i += 1
 			}
-			i += 2
-		case depth == 1 && ident_start_byte(c):
-			j := i
-			for j < n && ident_cont_byte(text[j]) {
-				j += 1
+			// i sits on the first `''` of a closing pair when one exists, else
+			// at the last byte of an unterminated string; consume the pair.
+			if i + 1 < n {
+				i += 2
+			} else {
+				i = n
 			}
-			if text[i:j] == "inputs" || text[i:j] == "outputs" {
-				return true
-			}
-			i = j
+			append(&tokens, Scan_Token{start = start, end = i, kind = .Indented})
+			code_start = i
 		case:
 			i += 1
 		}
 	}
-	return false
+	if code_start < i {
+		append(&tokens, Scan_Token{start = code_start, end = i, kind = .Code})
+	}
+	return tokens
+}
+
+// Scan_Kind classifies a token run: Code is structurally significant Nix
+// source; String, Indented and Comment are literal content whose braces never
+// count as structure.
+Scan_Kind :: enum {
+	Code,
+	String,
+	Indented,
+	Comment,
+}
+
+// Scan_Token is one run of Scan_Kind over the byte span [start, end) of the
+// scanned text.
+Scan_Token :: struct {
+	kind:       Scan_Kind,
+	start, end: int,
+}
+
+// LEGACY_NWS_GENERATED_HEADER is the header line the pre-block nws backend
+// (v1) wrote above every root flake it managed wholesale. It is used for
+// diagnostics only: such a file is serviced normally unless it also declares
+// its own top-level inputs/outputs (see has_own_top_level_io).
+LEGACY_NWS_GENERATED_HEADER :: "# nws-generated"
+
+// patch_refusal_reason explains why patch_flake would refuse to manage text
+// (fail-open), with an actionable remedy, so the daemon can log a clear
+// warning instead of silently leaving a workspace unmanaged. A file declaring
+// its own top-level `inputs`/`outputs` — including a legacy v1 flake with
+// the old `# nws-generated` header — gets a targeted message naming the
+// conflict and the remedy; any other refusal gets the generic
+// no-safe-injection-point message. The returned string is a static literal.
+patch_refusal_reason :: proc(text: string) -> string {
+	if has_own_top_level_io(text) {
+		if strings.contains(text, LEGACY_NWS_GENERATED_HEADER) {
+			return(
+				"flake was generated by an older nws (# nws-generated) and declares its own top-level inputs/outputs, which conflict with the nws block — delete the file (or remove its own inputs/outputs) to let nws regenerate it, or it stays unmanaged" \
+			)
+		}
+		return(
+			"flake declares its own top-level inputs/outputs, which conflict with the nws block — remove them to let nws manage it, or it stays unmanaged" \
+		)
+	}
+	return "no safe injection point (no top-level { ... } boundary)"
 }
 
 // last_top_level_brace returns the byte offset of the last closing `}` at the
@@ -226,25 +363,33 @@ has_own_top_level_io :: proc(text: string) -> bool {
 // are never mistaken for the outer boundary, and a file that ends while the
 // outer scope is still open (no top-level `}`) is reported as -1.
 //
-// Conservative by design: braces inside string literals or comments are
-// counted like any other char, which can shift the decision on pathological
-// input but never crashes — the caller refuses to patch when no brace is
-// found, so a user file is never corrupted.
+// Literal-aware (via scan_tokens): braces inside strings, indented strings
+// and comments are not counted, so a placeholder or comment whose text
+// contains `}` cannot shift the depth and mislead the injection point — the
+// block never lands inside a literal. The caller still refuses to patch when
+// no brace is found, so a user file is never corrupted.
 last_top_level_brace :: proc(text: string) -> int {
+	tokens := scan_tokens(text, context.allocator)
+	defer delete(tokens)
 	last := -1
 	depth := 0
-	for pos: int = 0; pos < len(text); pos += 1 {
-		switch text[pos] {
-		case '{':
-			depth += 1
-		case '}':
-			// pre-decrement depth 1: closes the outermost scope. The last one
-			// wins, so in a well-formed file this is the final `}`.
-			if depth == 1 {
-				last = pos
-			}
-			if depth > 0 {
-				depth -= 1
+	for tok in tokens {
+		if tok.kind != .Code {
+			continue
+		}
+		for pos := tok.start; pos < tok.end; pos += 1 {
+			switch text[pos] {
+			case '{':
+				depth += 1
+			case '}':
+				// Pre-decrement depth 1: closes the outermost scope. The last
+				// one wins, so in a well-formed file this is the final `}`.
+				if depth == 1 {
+					last = pos
+				}
+				if depth > 0 {
+					depth -= 1
+				}
 			}
 		}
 	}

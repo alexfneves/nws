@@ -1099,7 +1099,12 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 
 	new_text, ok := core.patch_flake(string(existing), block)
 	if !ok {
-		log_line(state.logging, "leaving flake alone (no safe injection point): %s", fl_path)
+		log_line(
+			state.logging,
+			"not managing %s: %s",
+			fl_path,
+			core.patch_refusal_reason(string(existing)),
+		)
 		return
 	}
 	defer delete(new_text)
@@ -1183,7 +1188,12 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 
 	new_text, ok := core.patch_flake(string(existing), block)
 	if !ok {
-		log_line(state.logging, "leaving flake alone (no safe injection point): %s", fl_path)
+		log_line(
+			state.logging,
+			"not managing %s: %s",
+			fl_path,
+			core.patch_refusal_reason(string(existing)),
+		)
 		return
 	}
 	defer delete(new_text)

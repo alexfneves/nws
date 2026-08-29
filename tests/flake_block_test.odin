@@ -114,8 +114,11 @@ test_has_nws_block :: proc(t: ^testing.T) {
 }
 
 // Injecting into a user flake: every existing byte is preserved and the block
-// lands before the final top-level closing `}`. Only flakes that do NOT
-// already declare their own top-level `inputs`/`outputs` are serviced (see
+// lands before the final top-level closing `}`. Because every nws block
+// leaves the outputs return set open at its END marker, the injection also
+// emits the return set's closer `  };` before the file's own `}` (mirroring
+// the create scaffold). Only flakes that do NOT already declare their own
+// top-level `inputs`/`outputs` are serviced (see
 // test_patch_flake_refuse_own_io below) — user content like description,
 // nixConfig and the file's own structure survives untouched.
 @(test)
@@ -132,8 +135,7 @@ test_patch_flake_inject :: proc(t: ^testing.T) {
 			"{\n  description = \"my flake\";\n  nixConfig = { allowUnfree = true; };\n",
 			"\n",
 			block,
-			"\n",
-			"\n",
+			"  };\n",
 			"}\n",
 		},
 	)

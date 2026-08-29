@@ -168,7 +168,9 @@ set. Concretely:
   why the END marker lives inside the return set: anything you write below it
   is ordinary Nix.
 - The two closing lines — the `};` of the return set and the flake's final
-  `}` — belong to the file, not the block. Leave them in place.
+  `}` — belong to the file, not the block. Leave them in place (when nws
+  injects a block into an existing flake it emits the `};` itself; when you
+  write a block by hand, keep both closing lines below the END marker).
 
 **Stable binding names (a contract):** your attributes may reference the
 block's internals by these names, which never change between generations:
@@ -209,6 +211,14 @@ devShell written against one generation keeps working after the next.
   that already declares its own top-level `inputs`/`outputs` (e.g. a devenv
   flake) is logged and left alone — injecting the block would duplicate
   those attributes and break evaluation.
+- **Legacy v1 flakes.** A root flake written by an older nws (with a
+  `# nws-generated — do not edit` header) declares its own top-level
+  `inputs`/`outputs`, so nws logs a warning and leaves it alone — never
+  corrupted, but no longer tracked. To migrate, delete the file (or remove
+  its own `inputs`/`outputs`) and let nws regenerate a block-managed flake on
+  the next scan, or insert the two marker lines yourself between your `{` and
+  the closing `}` — keeping the `};` and `}` closing lines below the
+  `# /nws block` line.
 - **Never crash on odd input.** Unreadable git configs, worktree-style `.git`
   files, corrupt state — everything fails open (the child just keeps its
   GitHub URL or gets a plain `path:` pin without a marker).

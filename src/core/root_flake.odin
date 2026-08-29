@@ -23,10 +23,11 @@ Child_Info :: struct {
 // children are emitted sorted by name regardless of input order, so calling
 // it twice with equal inputs yields byte-identical output. This is the
 // create-path shape (ISC-3): a plain user flake whose nws block is present —
-// `{` + the block (see generate_root_block) + `}` — with no magic
-// whole-file header. The daemon no longer calls it (it patches the block in
-// place), but the shape doubles as the minimal fresh flake nws writes when
-// flake.nix is absent, and any user content later added around the block
+// `{` + the block (see generate_root_block) + the return-set closer `  };` +
+// `}` — with no magic whole-file header. The daemon no longer calls it (it
+// patches the block in place), but the shape doubles as the minimal fresh
+// flake nws writes when flake.nix is absent, and any user content added
+// below the block's END marker (still inside the outputs return set)
 // survives regenerations.
 //
 // Each cloned child becomes `inputs.<name>.url = "path:./<name>"` with an
@@ -46,19 +47,23 @@ generate_root_flake :: proc(children: []Child_Info, allocator := context.allocat
 
 	strings.write_string(&b, "{\n")
 	strings.write_string(&b, block)
-	strings.write_string(&b, "}\n")
+	strings.write_string(&b, "  };\n}\n")
 
 	return strings.clone(strings.to_string(b), allocator)
 }
 
 // generate_root_block builds the nws-managed block for a flake-delegation
-// workspace: exactly the body emitted by generate_root_flake (the `inputs`
-// section with sibling overrides plus the delegated `outputs`, binding names
-// unchanged) wrapped in the NWS_BLOCK_BEGIN…NWS_BLOCK_END markers instead of
-// the whole-file header and outer braces. The daemon injects or updates this
-// block inside a user-owned flake; user content outside the markers is never
-// touched. Pure and deterministic like the whole-file form; the returned
-// string is allocated from `allocator` and owned by the caller.
+// workspace: exactly the body emitted by generate_root_flake — the `inputs`
+// section with sibling overrides plus the delegated `outputs` expression,
+// binding names unchanged — wrapped in the NWS_BLOCK_BEGIN…NWS_BLOCK_END
+// markers instead of the whole-file header and outer braces. The outputs
+// return set is LEFT OPEN at the END marker: the block ends inside `in {`
+// (after the generated `packages`/`devShells`/`apps`/`checks` attrs) and the
+// surrounding file closes the set (`  };`) and the flake (`}`). User output
+// attrs written below the END marker belong to the return set and survive
+// regeneration; user content outside the markers is never touched. Pure and
+// deterministic like the whole-file form; the returned string is allocated
+// from `allocator` and owned by the caller.
 generate_root_block :: proc(children: []Child_Info, allocator := context.allocator) -> string {
 	sorted := sorted_children(children, allocator)
 	defer delete(sorted)
@@ -96,8 +101,10 @@ sorted_children :: proc(
 // the `inputs` section (with sibling overrides) followed by the delegated
 // `outputs` — everything that lives between the NWS_BLOCK_BEGIN/NWS_BLOCK_END
 // markers of the block form (and, wrapped in the top-level `{ ... }`, of the
-// whole-file create shape). Zero children yields the minimal `inputs = {};`
-// plus the empty delegation.
+// whole-file create shape). The outputs return set is left OPEN: the last
+// line emitted is the final generated output attr, and the block's END
+// marker follows inside the set. Zero children yields the minimal
+// `inputs = {};` plus the empty delegation.
 write_root_body :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	if len(sorted) > 0 {
 		strings.write_string(b, "  inputs = {\n")
@@ -127,7 +134,9 @@ write_root_body :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 // root_flake_outputs emits the `outputs` section delegating the children's
 // packages/devShells/apps/checks under `<child>-` prefixed attribute names,
 // grouped per system: packages.<sys>.<child>-<attr>. With zero children every
-// delegated output is simply an empty attrset.
+// delegated output is simply an empty attrset. The return set stays OPEN
+// (no final `  };`): the block's END marker line closes the block inside the
+// set, and the surrounding file closes the set and the flake.
 root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	strings.write_string(b, `  outputs = { self, ... }@inputs:` + "\n")
 	strings.write_string(b, "  let\n")
@@ -168,7 +177,6 @@ root_flake_outputs :: proc(b: ^strings.Builder, sorted: []Child_Info) {
 	strings.write_string(b, `    devShells = delegate "devShells";` + "\n")
 	strings.write_string(b, `    apps = delegate "apps";` + "\n")
 	strings.write_string(b, `    checks = delegate "checks";` + "\n")
-	strings.write_string(b, "  };\n")
 }
 
 // is_nix_identifier reports whether name is a valid bare Nix identifier

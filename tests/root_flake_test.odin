@@ -58,8 +58,8 @@ test_root_flake_golden :: proc(t: ^testing.T) {
     devShells = delegate "devShells";
     apps = delegate "apps";
     checks = delegate "checks";
-  };
 # /nws block
+  };
 }
 `
 	testing.expectf(
@@ -81,10 +81,12 @@ test_root_flake_golden :: proc(t: ^testing.T) {
 
 // The block form carries the whole nws body between the markers: BEGIN on
 // its own line, then the identical inner text (inputs + delegated outputs),
-// then END on its own line. The whole-file form is the create-path shape
-// `{` + block + `}` — no managed header — and patch_flake("", block) (the
-// daemon's create path) produces the same bytes. Binding names are
-// unchanged, so user attrs referencing the delegation survive regeneration.
+// then END on its own line. The outputs return set is LEFT OPEN at the END
+// marker — the block ends inside `in {` after the generated attrs — and the
+// whole-file create shape closes the set and the flake: `{` + block +
+// `  };` + `}`. No managed header; patch_flake("", block) (the daemon's
+// create path) produces the same bytes. Binding names are unchanged, so
+// user attrs referencing the delegation survive regeneration.
 @(test)
 test_root_flake_block_golden :: proc(t: ^testing.T) {
 	children := []core.Child_Info {
@@ -112,13 +114,13 @@ test_root_flake_block_golden :: proc(t: ^testing.T) {
 	)
 
 	// ISC-3: the whole-file form wraps the block in a minimal `{ ... }` shell
-	// (no `# nws-generated` header line).
-	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	// (no whole-file header) plus the return-set closer.
+	want_whole := strings.concatenate({"{\n", block, "  };\n}\n"})
 	defer delete(want_whole)
 	testing.expectf(
 		t,
 		whole == want_whole,
-		"whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		"whole-file form must be `{` + block + `  };` + `}`:\n--- got ---\n%s\n--- want ---\n%s",
 		whole,
 		want_whole,
 	)
@@ -138,8 +140,9 @@ test_root_flake_block_golden :: proc(t: ^testing.T) {
 }
 
 // Empty children: the block still carries the minimal body (`inputs = {}`
-// plus the empty delegation) between its markers, and the whole-file form
-// still wraps it without any header.
+// plus the empty delegation) between its markers, with the return set left
+// open at the END marker, and the whole-file form still wraps it without any
+// header.
 @(test)
 test_root_flake_block_empty_children :: proc(t: ^testing.T) {
 	block := core.generate_root_block(nil)
@@ -159,12 +162,12 @@ test_root_flake_block_empty_children :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, strings.contains(block, "children = [ ];\n"), "empty delegation missing")
 
-	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	want_whole := strings.concatenate({"{\n", block, "  };\n}\n"})
 	defer delete(want_whole)
 	testing.expectf(
 		t,
 		whole == want_whole,
-		"empty whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		"empty whole-file form must be `{` + block + `  };` + `}`:\n--- got ---\n%s\n--- want ---\n%s",
 		whole,
 		want_whole,
 	)
@@ -314,8 +317,8 @@ test_root_flake_empty_children :: proc(t: ^testing.T) {
     devShells = delegate "devShells";
     apps = delegate "apps";
     checks = delegate "checks";
-  };
 # /nws block
+  };
 }
 `
 	testing.expectf(
@@ -392,8 +395,8 @@ test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
     devShells = delegate "devShells";
     apps = delegate "apps";
     checks = delegate "checks";
-  };
 # /nws block
+  };
 }
 `
 	testing.expectf(

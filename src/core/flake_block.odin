@@ -4,8 +4,17 @@ import "core:strings"
 
 // NWS_BLOCK_BEGIN marks the start of the region of a root flake owned by nws.
 // A root flake containing a well-formed BEGIN…END pair is serviced in place:
-// everything between the markers is nws's own output, everything outside is
-// the user's and is never touched.
+// the span [BEGIN, END) is nws's own output and gets replaced wholesale on
+// every regeneration; everything outside the span is the user's and is never
+// touched.
+//
+// The block body is LEFT OPEN at the END marker: generators emit the flake's
+// `inputs` section and an `outputs` expression whose return attrset stays
+// open (ending in `in {` plus the nws-owned output attrs), so the
+// `# /nws block` END line sits INSIDE that return set. User output attrs
+// (devShells, apps, ...) written below the END marker still belong to the
+// return set and survive regeneration; the `};` that closes the return set
+// and the flake's final `}` live in the surrounding file, never in the block.
 NWS_BLOCK_BEGIN :: "# nws block — managed by nws; do not edit"
 
 // NWS_BLOCK_END marks the end of the nws-owned region.
@@ -68,19 +77,27 @@ has_nws_block :: proc(text: string) -> bool {
 // patch_flake applies a complete block (its own BEGIN marker line, body, and
 // END marker line — owned by the caller, borrowed here) to existing:
 //
-//   - block present in existing → the marked span is replaced by block
-//     verbatim; user bytes outside the span are preserved.
+//   - block present in existing → the marked span [BEGIN, END) is replaced
+//     by block verbatim. Everything the user wrote below the END marker
+//     (their own output attrs inside the outputs return set, plus the `};`
+//     and `}` closers) is byte-preserved across regenerations — this is
+//     where user devShells/apps live and survive.
 //   - no block present → the block is injected before the last top-level
 //     closing `}` (the flake's outer scope): `before + "\n" + block + "\n" +
-//     "\n" + closer`; every existing byte is preserved.
+//     "\n" + closer`; every existing byte is preserved. A file that already
+//     declares top-level `inputs`/`outputs` of its own is refused (fail-open,
+//     unchanged): the block defines both attributes, so injecting would
+//     produce duplicate-attribute evaluation errors and break the file.
 //   - empty/whitespace-only existing (no flake at all) → a fresh minimal
-//     flake wrapping the block: "{\n" + block + "}\n" — the daemon's
-//     create path.
+//     flake wrapping the block: "{\n" + block + "  };\n}\n" — the daemon's
+//     create path. The block leaves the outputs return set open, so the
+//     create scaffold closes it (`  };`) before closing the flake (`}`).
 //
 // ok is false — and existing is returned unchanged — when no safe injection
-// point exists (no top-level `{ ... }` boundary), so an unparseable user file
-// is never touched. Deterministic: same inputs produce the same bytes. The
-// returned string is freshly allocated and owned by the caller.
+// point exists (no top-level `{ ... }` boundary) or the file already owns
+// its inputs/outputs, so an unparseable or self-managing user file is never
+// touched. Deterministic: same inputs produce the same bytes. The returned
+// string is freshly allocated and owned by the caller.
 patch_flake :: proc(existing, block: string) -> (string, bool) {
 	if start, end, ok := find_nws_block(existing); ok {
 		b := strings.builder_make(context.allocator)
@@ -96,12 +113,27 @@ patch_flake :: proc(existing, block: string) -> (string, bool) {
 	// result is a valid flake.nix the user may then extend. The block carries
 	// its own trailing newline after the END marker, so `}` lands on its own.
 	if len(strings.trim_space(existing)) == 0 {
+		// Create path: an empty or whitespace-only file is not a flake to
+		// patch — wrap the block in a fresh minimal `{ ... }` scaffold. The
+		// block leaves the return set open (END sits inside it), so the
+		// scaffold appends the return set's closer `  };` before the flake's
+		// `}`. The result is a valid flake.nix the user may then extend below
+		// the END marker.
 		b := strings.builder_make(context.allocator)
 		defer strings.builder_destroy(&b)
 		strings.write_string(&b, "{\n")
 		strings.write_string(&b, block)
-		strings.write_string(&b, "}\n")
+		strings.write_string(&b, "  };\n}\n")
 		return strings.clone(strings.to_string(b), context.allocator), true
+	}
+
+	// Refuse to inject into a flake that already declares its own top-level
+	// `inputs`/`outputs`: the block defines both, so injecting produces
+	// duplicate-attribute errors ("attribute 'outputs' already defined") that
+	// break evaluation. Such a file already manages its flake wiring itself
+	// (e.g. a devenv flake); leave it alone — fail-open, never corrupt.
+	if has_own_top_level_io(existing) {
+		return existing, false
 	}
 
 	pos := last_top_level_brace(existing)
@@ -117,6 +149,72 @@ patch_flake :: proc(existing, block: string) -> (string, bool) {
 	strings.write_string(&b, "\n")
 	strings.write_string(&b, existing[pos:])
 	return strings.clone(strings.to_string(b), context.allocator), true
+}
+
+// has_own_top_level_io reports whether text declares an `inputs` or
+// `outputs` attribute of its own directly inside the flake's outer `{ ... }`
+// shell (brace depth 1 — the level the nws block occupies). Both the
+// attrset form (`inputs = { ... }`, `outputs = { self }: ...`) and the
+// dotted form (`inputs.<name>.url = ...`) are recognised. Strings, comments,
+// and the `${ ... }` contents of indented strings are skipped so prose or
+// descriptions cannot trip it; anything ambiguous is treated as a hit — the
+// caller refuses to inject (fail-open), which is always safe: the worst case
+// is a file left alone, never a duplicate-attribute flake.
+has_own_top_level_io :: proc(text: string) -> bool {
+	depth := 0
+	i := 0
+	n := len(text)
+	for i < n {
+		c := text[i]
+		switch {
+		case c == '{':
+			depth += 1
+			i += 1
+		case c == '}':
+			if depth > 0 {
+				depth -= 1
+			}
+			i += 1
+		case c == '#':
+			// Comment: skip to end of line.
+			for i < n && text[i] != '\n' {
+				i += 1
+			}
+		case c == '"':
+			// Double-quoted string: skip to the closing quote, honouring
+			// backslash escapes; an unterminated line bails conservatively.
+			i += 1
+			for i < n && text[i] != '\n' {
+				if text[i] == '\\' {
+					i += 2
+				} else if text[i] == '"' {
+					i += 1
+					break
+				} else {
+					i += 1
+				}
+			}
+		case c == '\'' && i + 1 < n && text[i + 1] == '\'':
+			// Indented string: skip to the closing `''`.
+			i += 2
+			for i + 1 < n && !(text[i] == '\'' && text[i + 1] == '\'') {
+				i += 1
+			}
+			i += 2
+		case depth == 1 && ident_start_byte(c):
+			j := i
+			for j < n && ident_cont_byte(text[j]) {
+				j += 1
+			}
+			if text[i:j] == "inputs" || text[i:j] == "outputs" {
+				return true
+			}
+			i = j
+		case:
+			i += 1
+		}
+	}
+	return false
 }
 
 // last_top_level_brace returns the byte offset of the last closing `}` at the

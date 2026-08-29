@@ -95,8 +95,8 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
         }
       else spliced0.tf2);
     };
-  };
 # /nws block
+  };
 }
 `
 	testing.expectf(
@@ -116,11 +116,14 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
 
 // The block form carries the whole nws body between the markers: BEGIN on
 // its own line, then the identical inner text (inputs + outputs sections),
-// then END on its own line. Every binding name stays put (`spliced0`,
-// `childCalls0`, `base0`, `overlay0`, `nixpkgs`, `inputs`) so user attrs
-// referencing block internals survive regeneration. The whole-file form is
-// the create-path shape `{` + block + `}` — no managed header — and
-// patch_flake("", block) produces the same bytes.
+// then END on its own line. The outputs return set is LEFT OPEN at the END
+// marker — the block ends inside `in {` after the generated attrs — and the
+// whole-file create shape closes the set and the flake: `{` + block +
+// `  };` + `}`. Every binding name stays put (`spliced0`, `childCalls0`,
+// `base0`, `overlay0`, `nixpkgs`, `inputs`) so user attrs referencing block
+// internals — written below the END marker, still inside outputs — survive
+// regeneration. patch_flake("", block) produces the same bytes as the
+// whole-file form.
 @(test)
 test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
@@ -149,13 +152,13 @@ test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 	)
 
 	// ISC-3: the whole-file form wraps the block in a minimal `{ ... }` shell
-	// (no `# nws-generated` header line).
-	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	// (no whole-file header) plus the return-set closer.
+	want_whole := strings.concatenate({"{\n", block, "  };\n}\n"})
 	defer delete(want_whole)
 	testing.expectf(
 		t,
 		whole == want_whole,
-		"whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		"whole-file form must be `{` + block + `  };` + `}`:\n--- got ---\n%s\n--- want ---\n%s",
 		whole,
 		want_whole,
 	)
@@ -174,9 +177,10 @@ test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 	}
 }
 
-// Empty children: the block still carries the minimal body (`outputs = { ...
-// }: {};`) between its markers, and the whole-file form still wraps it
-// without any header.
+// Empty children: the block still carries the minimal body between its
+// markers — an open `outputs = { ... }@inputs:` return set — and the
+// whole-file form still wraps it without any header, closing the set with
+// `  };` and the flake with `}`.
 @(test)
 test_overlay_flake_block_empty_children :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
@@ -191,19 +195,19 @@ test_overlay_flake_block_empty_children :: proc(t: ^testing.T) {
 	testing.expectf(t, strings.has_suffix(block, block_suffix), "END marker missing")
 
 	// ISC-10: zero children still yields a valid, block-carrying flake whose
-	// body is the minimal `outputs = { ... }: {};`.
+	// body is the minimal open return set.
 	testing.expectf(
 		t,
-		strings.contains(block, "  outputs = { ... }: {};\n"),
+		strings.contains(block, "  outputs = { ... }@inputs:\n  {\n"),
 		"minimal body missing",
 	)
 
-	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	want_whole := strings.concatenate({"{\n", block, "  };\n}\n"})
 	defer delete(want_whole)
 	testing.expectf(
 		t,
 		whole == want_whole,
-		"empty whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		"empty whole-file form must be `{` + block + `  };` + `}`:\n--- got ---\n%s\n--- want ---\n%s",
 		whole,
 		want_whole,
 	)
@@ -249,8 +253,10 @@ test_overlay_flake_empty_children :: proc(t: ^testing.T) {
 
 	want := `{
 # nws block — managed by nws; do not edit
-  outputs = { ... }: {};
+  outputs = { ... }@inputs:
+  {
 # /nws block
+  };
 }
 `
 	testing.expectf(t, got == want, "empty-children mismatch:\n%s", got)
@@ -390,8 +396,8 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
         }
       else spliced0.foo);
     };
-  };
 # /nws block
+  };
 }
 `
 	testing.expectf(

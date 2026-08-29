@@ -21,11 +21,12 @@ Overlay_Child :: struct {
 // matched children into that set via `overrideScope'` when it is a fixpoint
 // scope (so shadowing propagates to consumers), or a plain attrset merge
 // otherwise. This is the create-path shape (ISC-3): a plain user flake whose
-// nws block is present — `{` + the block (see generate_overlay_block) + `}`
-// — with no magic whole-file header. The daemon no longer calls it (it
-// patches the block in place), but the shape doubles as the minimal fresh
-// flake nws writes when flake.nix is absent, and user content later added
-// around the block survives regenerations.
+// nws block is present — `{` + the block (see generate_overlay_block) + the
+// return-set closer `  };` + `}` — with no magic whole-file header. The
+// daemon no longer calls it (it patches the block in place), but the shape
+// doubles as the minimal fresh flake nws writes when flake.nix is absent,
+// and user content added below the block's END marker (still inside the
+// outputs return set) survives regenerations.
 //
 // Like generate_root_flake this is a pure function of its arguments: children
 // are emitted sorted by name (ties broken by rel_path), everything is written
@@ -58,7 +59,7 @@ generate_overlay_root_flake :: proc(
 
 	strings.write_string(&b, "{\n")
 	strings.write_string(&b, block)
-	strings.write_string(&b, "}\n")
+	strings.write_string(&b, "  };\n}\n")
 
 	return strings.clone(strings.to_string(b), allocator)
 }
@@ -68,8 +69,11 @@ generate_overlay_root_flake :: proc(
 // binding names preserved (`spliced0`, `childCalls0`, `base0`, `overlay0`,
 // `nixpkgs`, `inputs`) so user attrs referencing block internals survive
 // regeneration — wrapped in the NWS_BLOCK_BEGIN…NWS_BLOCK_END markers instead
-// of the whole-file header and outer braces. The daemon injects or updates
-// this block inside a user-owned flake; user content outside the markers is
+// of the whole-file header and outer braces. The outputs return set is LEFT
+// OPEN at the END marker: the block ends inside `in {` (after the generated
+// output attrs) and the surrounding file closes the set (`  };`) and the
+// flake (`}`). User output attrs written below the END marker belong to the
+// return set and survive regeneration; user content outside the markers is
 // never touched. Pure and deterministic like the whole-file form; the
 // returned string is allocated from `allocator` and owned by the caller.
 generate_overlay_block :: proc(
@@ -128,13 +132,17 @@ overlay_emit_children :: proc(
 // write_overlay_body writes the nws-owned body of an overlay root flake:
 // everything that lives between the NWS_BLOCK_BEGIN/NWS_BLOCK_END markers of
 // the block form (and, wrapped in the top-level `{ ... }`, of the whole-file
-// create shape). Zero safe children yields the minimal valid body
-// `outputs = { ... }: {};`.
+// create shape). The outputs return set is LEFT OPEN: the last line emitted
+// is the final generated output attr, and the block's END marker follows
+// inside the set. Zero safe children yields the minimal valid body.
 write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Workspace_Config) {
 	// Zero safe children: minimal valid managed flake (its nws block still
-	// marks the flake as serviced by the daemon).
+	// marks the flake as serviced by the daemon) — an empty outputs return
+	// set, left open for the END marker; the surrounding file closes it with
+	// `  };` and the flake with `}`.
 	if len(emit) == 0 {
-		strings.write_string(b, "  outputs = { ... }: {};\n")
+		strings.write_string(b, "  outputs = { ... }@inputs:\n")
+		strings.write_string(b, "  {\n")
 		return
 	}
 
@@ -381,8 +389,6 @@ write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Work
 	write_attr_key(b, emit[0].name)
 	strings.write_string(b, ");\n")
 	strings.write_string(b, "    };\n")
-
-	strings.write_string(b, "  };\n")
 }
 
 // write_input_name writes the flake input name for the i-th *flake* overlay

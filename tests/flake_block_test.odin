@@ -114,10 +114,13 @@ test_has_nws_block :: proc(t: ^testing.T) {
 }
 
 // Injecting into a user flake: every existing byte is preserved and the block
-// lands before the final top-level closing `}`.
+// lands before the final top-level closing `}`. Only flakes that do NOT
+// already declare their own top-level `inputs`/`outputs` are serviced (see
+// test_patch_flake_refuse_own_io below) — user content like description,
+// nixConfig and the file's own structure survives untouched.
 @(test)
 test_patch_flake_inject :: proc(t: ^testing.T) {
-	user := "{\n  description = \"my flake\";\n  inputs = { nixpkgs.url = \"github:nixos/nixpkgs\"; };\n  outputs = { self, nixpkgs }: { packages.x86_64-linux.hello = nixpkgs.hello; };\n}\n"
+	user := "{\n  description = \"my flake\";\n  nixConfig = { allowUnfree = true; };\n}\n"
 	block := core.NWS_BLOCK_BEGIN + "\n  inputs = { };\n" + core.NWS_BLOCK_END + "\n"
 
 	got, ok := core.patch_flake(user, block)
@@ -126,7 +129,7 @@ test_patch_flake_inject :: proc(t: ^testing.T) {
 
 	want := strings.concatenate(
 		{
-			"{\n  description = \"my flake\";\n  inputs = { nixpkgs.url = \"github:nixos/nixpkgs\"; };\n  outputs = { self, nixpkgs }: { packages.x86_64-linux.hello = nixpkgs.hello; };\n",
+			"{\n  description = \"my flake\";\n  nixConfig = { allowUnfree = true; };\n",
 			"\n",
 			block,
 			"\n",
@@ -146,6 +149,136 @@ test_patch_flake_inject :: proc(t: ^testing.T) {
 		t,
 		strings.contains(got, "description = \"my flake\";"),
 		"user content must survive",
+	)
+}
+
+// A flake that already declares its own top-level `inputs`/`outputs` is
+// refused: the nws block defines both attributes, so injecting would produce
+// duplicate-attribute evaluation errors ("attribute 'outputs' already
+// defined"). The file is returned unchanged — fail-open, never corrupted.
+// Dotted `inputs.<name>.url = ...` declarations count too.
+@(test)
+test_patch_flake_refuse_own_io :: proc(t: ^testing.T) {
+	block := core.NWS_BLOCK_BEGIN + "\n  inputs = { };\n" + core.NWS_BLOCK_END + "\n"
+	cases := []string {
+		"{\n  inputs = {\n    nixpkgs.url = \"github:NixOS/nixpkgs\";\n  };\n}\n",
+		"{\n  outputs = { self }: { };\n}\n",
+		"{\n  outputs = { self, nixpkgs, ... } @ inputs: { };\n}\n",
+		"{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n}\n",
+		"{ inputs = { a = 1; }; outputs = { self }: { }; }\n", // one-liner
+	}
+	for text in cases {
+		got, ok := core.patch_flake(text, block)
+		testing.expectf(t, !ok, "must refuse to inject into %q", text)
+		testing.expectf(t, got == text, "refused file must be returned unchanged, got %q", got)
+	}
+
+	// False-positive guards: `inputs`/`outputs` inside strings and comments
+	// must NOT trigger the refusal.
+	injectable := []string {
+		"{\n  description = \"our outputs are documented upstream\";\n}\n",
+		"{\n  # outputs live in the child flakes\n}\n",
+		"{\n  description = \"inputs go here\";\n  nixConfig = { }\n}\n",
+	}
+	for text in injectable {
+		got, ok := core.patch_flake(text, block)
+		testing.expectf(
+			t,
+			ok && strings.contains(got, core.NWS_BLOCK_BEGIN),
+			"injectable flake must be serviced: %q",
+			text,
+		)
+		defer delete(got)
+	}
+}
+
+// The user-facing persistence contract: a user output attr (here a devShell)
+// written inside the outputs return set, BELOW the END marker, survives
+// regeneration. patch_flake replaces only the marked span [BEGIN, END), so
+// user attrs between the END marker and the `};` that closes the return set
+// are byte-preserved while the generated body updates.
+@(test)
+test_patch_flake_user_output_attrs_survive :: proc(t: ^testing.T) {
+	// Deliberately minimal generator-shaped blocks: BEGIN + owned body ending
+	// with an OPEN outputs return set + END marker.
+	block_v1 := strings.concatenate(
+		{
+			core.NWS_BLOCK_BEGIN,
+			"\n",
+			"  inputs = { };\n",
+			"  outputs = { self, ... }@inputs:\n",
+			"  let\n",
+			"    spliced0 = { };\n",
+			"  in\n",
+			"  {\n",
+			"    packages.x86_64-linux.default = null;\n",
+			core.NWS_BLOCK_END,
+			"\n",
+		},
+	)
+	defer delete(block_v1)
+
+	created, ok := core.patch_flake("", block_v1)
+	defer delete(created)
+	testing.expectf(t, ok, "create must succeed")
+	testing.expectf(
+		t,
+		strings.has_suffix(created, "  };\n}\n"),
+		"create scaffold must close the return set and the flake:\n%s",
+		created,
+	)
+	testing.expectf(t, core.count_braces(created) == 0, "created flake must be brace-balanced")
+
+	// The user adds a devShell below the END marker, still inside outputs.
+	devshell := "    devShells.x86_64-linux.default = spliced0.buildEnv { name = \"dev\"; };\n"
+	end_at := strings.index(created, core.NWS_BLOCK_END)
+	testing.expectf(t, end_at >= 0, "END marker missing from created flake")
+	after_end := end_at + len(core.NWS_BLOCK_END)
+	edited := strings.concatenate({created[:after_end], "\n", devshell, created[after_end:]})
+	defer delete(edited)
+	testing.expectf(t, strings.contains(edited, devshell), "devShell must be present after edit")
+
+	// Regeneration with an updated block body (an input appeared).
+	block_v2 := strings.concatenate(
+		{
+			core.NWS_BLOCK_BEGIN,
+			"\n",
+			"  inputs = { alpha.url = \"path:./alpha\"; };\n",
+			"  outputs = { self, ... }@inputs:\n",
+			"  let\n",
+			"    spliced0 = { };\n",
+			"  in\n",
+			"  {\n",
+			"    packages.x86_64-linux.default = spliced0.alpha;\n",
+			core.NWS_BLOCK_END,
+			"\n",
+		},
+	)
+	defer delete(block_v2)
+
+	got, ok2 := core.patch_flake(edited, block_v2)
+	defer delete(got)
+	testing.expectf(t, ok2, "update must succeed")
+	testing.expectf(t, strings.contains(got, devshell), "user devShell must survive regeneration")
+	testing.expect(t, !strings.contains(got, "inputs = { };"), "generated body must update")
+	testing.expect(
+		t,
+		strings.contains(got, `alpha.url = "path:./alpha";`),
+		"new generated body must be present",
+	)
+	testing.expect(t, !strings.contains(got, "default = null;"), "old body attrs must be replaced")
+	testing.expectf(t, strings.has_suffix(got, "  };\n}\n"), "closers must survive")
+	testing.expectf(t, core.count_braces(got) == 0, "regen result must be brace-balanced")
+
+	// A second regeneration with the same block is a byte no-op — the loop
+	// guard holds even with user content present below the END marker.
+	again, ok3 := core.patch_flake(got, block_v2)
+	defer delete(again)
+	testing.expectf(t, ok3, "second update must succeed")
+	testing.expectf(
+		t,
+		again == got,
+		"identical block must be a byte no-op even with user attrs present",
 	)
 }
 
@@ -188,8 +321,7 @@ test_patch_flake_update :: proc(t: ^testing.T) {
 
 // Unparseable text (no top-level `{ ... }` boundary) → unchanged + false.
 // (The empty/whitespace-only case is the CREATE path — see
-// test_patch_flake_create.)
-@(test)
+// test_patch_flake_create.)@(test)
 test_patch_flake_unparseable :: proc(t: ^testing.T) {
 	block := core.NWS_BLOCK_BEGIN + "\n" + core.NWS_BLOCK_END + "\n"
 	cases := []string {
@@ -227,13 +359,19 @@ test_patch_flake_empty_block :: proc(t: ^testing.T) {
 
 // Create path: an empty or whitespace-only existing file is not a flake to
 // patch — patch_flake wraps the block in a fresh minimal `{ ... }` scaffold
-// (the daemon's no-flake path). The result must round-trip: repatching with
-// the same block is a byte no-op, which is what prevents the self-trigger
-// loop on a freshly created file.
+// (the daemon's no-flake path). The block leaves the outputs return set
+// open, so the scaffold appends the return set's closer `  };` before the
+// flake's `}`. The result must be a brace-balanced flake and round-trip:
+// repatching with the same block is a byte no-op, which is what prevents
+// the self-trigger loop on a freshly created file.
 @(test)
 test_patch_flake_create :: proc(t: ^testing.T) {
-	block := core.NWS_BLOCK_BEGIN + "\n  inputs = { };\n" + core.NWS_BLOCK_END + "\n"
-	want := strings.concatenate({"{\n", block, "}\n"})
+	block :=
+		core.NWS_BLOCK_BEGIN +
+		"\n  outputs = { self, ... }@inputs:\n  {\n" +
+		core.NWS_BLOCK_END +
+		"\n"
+	want := strings.concatenate({"{\n", block, "  };\n}\n"})
 	defer delete(want)
 
 	inputs := []string{"", "  \n\t\n", "\n\n"}
@@ -250,6 +388,7 @@ test_patch_flake_create :: proc(t: ^testing.T) {
 			want,
 		)
 		testing.expectf(t, strings.contains(got, block), "block must be preserved verbatim")
+		testing.expectf(t, core.count_braces(got) == 0, "created flake must be brace-balanced")
 
 		roundtrip, ok2 := core.patch_flake(got, block)
 		defer delete(roundtrip)

@@ -11,12 +11,15 @@
 #   7. inject a ROS dev shell (USER LAYER on the managed flake), then HOLD;
 #      pressing Ctrl+C unregisters, stops the daemon and deletes the folder
 #
-# Philosophy: nws is GENERIC. It owns only the substitution machinery in the
-# flake (inputs, splice, packages.<system>, default). It never emits a
-# devShell and knows nothing about ROS. The dev shell is the USER's layer —
-# here run.sh injects it once after nws generates. Because nws regenerates
-# flake.nix on fs events, a later regeneration drops it (expected); re-inject
-# by re-running this script.
+# Philosophy: nws is GENERIC. It owns only its marked nws block in the flake
+# (the region between `# nws block — managed by nws; do not edit` and
+# `# /nws block`: inputs, splice, packages.<system>, default) and never emits
+# a devShell or knows anything about ROS. Everything else in flake.nix — a
+# description, nixConfig, and any user output attr written below the block's
+# END marker, like this dev shell — is ordinary USER content that nws
+# byte-preserves across regenerations. So the devShell is injected ONCE, in
+# its permanent home below `# /nws block`, and survives the daemon's updates
+# instead of fighting them.
 #
 # Use from the repo root's build artifacts:
 #   from the project root:   result/bin/nws  (built via nix build .#main)
@@ -115,12 +118,16 @@ cd "$WS"
 nix build --extra-experimental-features 'nix-command flakes' 2>&1 | tail -30
 
 ###############################################################################
-# 6b. USER LAYER: inject a ROS dev shell into the managed flake.
+# 6b. USER LAYER: inject a ROS dev shell into the (user-owned) workspace flake.
 #
-# nws owns only the substitution part and never emits a devShell. This is the
-# user's responsibility — demonstrated here by layering a devShell on top.
-# nws regenerates flake.nix on each fs event, so a later regeneration drops
-# this block (that is expected); re-run this script to re-inject.
+# nws owns only its nws block (between `# nws block — managed by nws; do not
+# edit` and `# /nws block`) and never writes a devShell — dev shells are
+# ordinary user content. nws preserves everything outside its block, so the
+# devShell is injected ONCE, below the "# /nws block" END marker (inside the
+# outputs return set, the user-owned ground nws never rewrites), and it
+# SURVIVES regeneration: the daemon keeps updating its own block above
+# (inputs, splice, packages.<system>, default) and leaves the devShell and the
+# file's closing braces alone.
 ###############################################################################
 DEV_MARK="# nws-dev-shell (user layer, injected by run.sh)"
 SYS="x86_64-linux"
@@ -164,6 +171,11 @@ EOSRC
 EOF
 }
 
+# Insert the devShell immediately AFTER the "# /nws block" END marker line, so
+# it lands inside the outputs return set — the stable user-owned ground below
+# the marker that nws regenerations never touch. Idempotent via the marker
+# guard (a reused workspace keeps the injection). Pure bash, dash-safe, no
+# python3.
 inject_devshell() {
   local f="$WS/flake.nix"
   [ -f "$f" ] || return 1
@@ -171,62 +183,38 @@ inject_devshell() {
   local block
   block="$(build_devshell_block "$DEV_MARK" "$SYS")"
   [ -n "$block" ] || return 1
-  # Insert the block before the LAST top-level "  };" (the outputs close).
-  # Pure bash (no python3 / no process substitution / dash-safe). The
-  # workspace flake regenerates to a clean nws form on fs events, so normally
-  # there is no pre-existing devShell to strip; the marker guard above makes
-  # this idempotent on a reused workspace.
   local anchor total out
-  anchor="$(grep -n '^  };$' "$f" | tail -1 | cut -d: -f1)"
+  anchor="$(grep -n '^# /nws block$' "$f" | tail -1 | cut -d: -f1)"
   total="$(wc -l < "$f")"
   [ -n "$anchor" ] && [ "$anchor" -gt 0 ] || return 1
   out="$f.tmp"
-  head -n "$((anchor-1))" "$f" > "$out"
+  head -n "$anchor" "$f" > "$out"
   printf '%s\n\n' "$block" >> "$out"
-  tail -n "$((total-anchor+1))" "$f" >> "$out"
+  tail -n "$((total-anchor))" "$f" >> "$out"
   mv "$out" "$f"
 }
 
-# after injecting, assert the flake has exactly one devShell with the ++ shape
-assert_devshell_ok() {
-  local n b
-  n=$(grep -c 'devShells.x86_64-linux.default' "$WS/flake.nix" || true)
-  b=$(grep -c 'paths = \[ spliced0.ros-base \];' "$WS/flake.nix" || true)
-  if [ "$n" != "1" ] || [ "$b" != "1" ]; then
-    echo "WARN: devShell inject assertion failed (found devShell=$n, ros-base-shape=$b)"
-    return 1
-  fi
-  return 0
-}
-
-# inject, retrying until the flake is stable (daemon may still be settling
-# regens and briefly write the minimal {} form which has no anchor)
-for _t in $(seq 1 10); do
-  inject_devshell
-  assert_devshell_ok && { INJ_OK=1; break; }
-  sleep 1
-done
-if [ "${INJ_OK:-0}" != "1" ]; then
-  echo "WARN: dev shell injection failed (flake kept regenerating)"
+inject_devshell
+if grep -qF "$DEV_MARK" "$WS/flake.nix" 2>/dev/null; then
+  echo "==> devShell injected below the nws block END marker — it survives regeneration"
+else
+  echo "WARN: dev shell injection failed (no '# /nws block' anchor found)"
 fi
 
 # 7. everything is up — hand the workspace to the user.
-# NOTE: nws regenerates flake.nix on fs events and rewrites the WHOLE file,
-# so a re-run of the daemon / a real workspace edit will drop the dev shell.
-# That is expected: the dev shell is a USER layer. Re-inject it after any
-# regeneration by running the inject snippet below (we keep it printed here;
-# Ctrl+C still cleans up).
+# nws regenerates ONLY its own block on fs events; the user's devShell and the
+# file's closing braces live outside it and persist. Edit the devShell (or add
+# more outputs / devenv) below the "# /nws block" line at any time — the
+# daemon will leave your content alone while it keeps updating its block.
 echo
 echo
 echo "==> SUCCESS"
 echo "==> Workspace ready at:    $WS"
 echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
 echo "==> Try it:  cd $WS  &&  nix develop"
-echo "==> NOTE: the devShell is a USER LAYER — nws does not own it. nws"
-echo "    regenerates flake.nix on any fs event, which drops it. Re-inject"
-echo "    after a regeneration by re-running this script (it restarts the"
-echo "    daemon), or paste the devShells block from the inject function"
-echo "    above into $WS/flake.nix yourself."
+echo "==> The devShell lives below the '# /nws block' marker as ordinary user"
+echo "    content. nws updates only its own block above it, so the devShell"
+echo "    survives; add more outputs below the marker (or devenv) freely."
 echo "==> Press Ctrl+C to stop the daemon and delete the workspace."
 while true; do
   sleep 3600

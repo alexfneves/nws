@@ -941,7 +941,9 @@ atomic_write :: proc(path, text: string, logging: bool, what: string) -> bool {
 //   - no root flake        → create a minimal file wrapping the generated block
 //   - root with nws block  → the marked region is replaced; user bytes outside
 //     the markers are never touched
-//   - user-authored root   → the block is injected before the final closing `}`
+//   - user-authored root   → the block is injected before the final closing `}`;
+//     a flake that already declares its own top-level inputs/outputs is left
+//     alone (injecting the block would duplicate them)
 //   - unparseable root     → log and never touch
 //   - patched bytes equal  → skip the write (no self-trigger loop)
 sync_workspace :: proc(state: ^Daemon_State, path: string) {
@@ -1097,7 +1099,7 @@ sync_workspace :: proc(state: ^Daemon_State, path: string) {
 
 	new_text, ok := core.patch_flake(string(existing), block)
 	if !ok {
-		log_line(state.logging, "leaving flake alone (unparseable): %s", fl_path)
+		log_line(state.logging, "leaving flake alone (no safe injection point): %s", fl_path)
 		return
 	}
 	defer delete(new_text)
@@ -1181,7 +1183,7 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 
 	new_text, ok := core.patch_flake(string(existing), block)
 	if !ok {
-		log_line(state.logging, "leaving flake alone (unparseable): %s", fl_path)
+		log_line(state.logging, "leaving flake alone (no safe injection point): %s", fl_path)
 		return
 	}
 	defer delete(new_text)

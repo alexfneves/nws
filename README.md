@@ -103,19 +103,30 @@ nws unregister ~/workspaces/mytree
 ## How the generated root flake works
 
 For each workspace, the daemon scans its **first-level subfolders** and treats
-any containing `.git` or a `flake.nix` as a child repo. It then generates
-`<workspace>/flake.nix`, which always starts with the header:
+any containing `.git` or a `flake.nix` as a child repo. It then manages
+`<workspace>/flake.nix` as a **user-owned flake with a managed nws block**:
+
+- **No `flake.nix` yet** → nws creates a minimal one whose only content is
+  the nws block.
+- **`flake.nix` exists** → nws parses it and injects or updates **only its
+  own marked block**, the region between these two lines:
 
 ```nix
-# nws-generated — do not edit
+# nws block — managed by nws; do not edit
+# /nws block
 ```
+
+  Everything outside the block is yours — `description`, `nixConfig`,
+  formatting, comments, and the `};`/`}` that close the flake — and is
+  byte-preserved across every regeneration.
 
 A minimal example with two children, where `app` declares `lib` as a flake
 input:
 
 ```nix
-# nws-generated — do not edit
 {
+  description = "my workspace";   # ← user-owned, survives regeneration
+# nws block — managed by nws; do not edit
   inputs = {
     app.url = "path:./app"; # nws: https://github.com/my-org/app.git
     # sibling wiring: app's own input `lib` resolves to the local checkout
@@ -132,9 +143,37 @@ input:
     devShells = delegate "devShells";
     apps      = delegate "apps";
     checks    = delegate "checks";
+# /nws block
+    devShells.x86_64-linux.ros = ...;   # ← your own outputs go below the END marker
   };
 }
 ```
+
+### The block: what nws owns, what you own
+
+The nws block is **self-contained** — it declares the workspace's `inputs` and
+the entire `outputs` expression (the `let … in { … }` with the generated
+outputs) — and its `# /nws block` END line sits **inside** the outputs return
+set. Concretely:
+
+- nws **owns** everything above the END marker: inputs, sibling wiring, and
+  the delegation/overlay machinery. That region is rewritten on every
+  regeneration.
+- You **own** everything below the END marker, still inside `outputs`: add
+  your own output attributes (a `devShells.<system>.default`, extra
+  `packages`, …) there. They survive regeneration verbatim, because nws only
+  ever rewrites up to the END line.
+- Nix rejects flake attributes outside `outputs` (a top-level
+  `devShells = …` is an "unsupported attribute" error), which is precisely
+  why the END marker lives inside the return set: anything you write below it
+  is ordinary Nix.
+- The two closing lines — the `};` of the return set and the flake's final
+  `}` — belong to the file, not the block. Leave them in place.
+
+**Stable binding names (a contract):** your attributes may reference the
+block's internals by these names, which never change between generations:
+`spliced0`, `childCalls0`, `base0`, `overlay0`, `nixpkgs`, `inputs`. A
+devShell written against one generation keeps working after the next.
 
 ### The rules
 
@@ -163,9 +202,13 @@ input:
 
 - **Never modify a child repo.** Children are only read (`.git/config`, and
   their `flake.nix` for input-name parsing). Your checkouts stay pristine.
-- **Never touch a user-authored root flake.** If `<workspace>/flake.nix`
-  exists without the `# nws-generated` header, the daemon logs and skips it.
-  Delete the generated file and the next event recreates it.
+- **Never touch user content outside the block.** `description`, `nixConfig`,
+  formatting, comments, and any attrs you write below the `# /nws block`
+  line are preserved verbatim; regeneration rewrites only the marked block,
+  atomically (temp file + rename) and only when the bytes differ. A flake
+  that already declares its own top-level `inputs`/`outputs` (e.g. a devenv
+  flake) is logged and left alone — injecting the block would duplicate
+  those attributes and break evaluation.
 - **Never crash on odd input.** Unreadable git configs, worktree-style `.git`
   files, corrupt state — everything fails open (the child just keeps its
   GitHub URL or gets a plain `path:` pin without a marker).
@@ -175,7 +218,7 @@ input:
 Earlier versions rewrote child flakes in place (inline `# nws:` markers
 inside each repo). Those markers are now inert comments; the daemon no longer
 touches child flakes at all. Remove the markers from your repos at your
-leisure, and let the daemon own the workspace root instead.
+leisure — nws now manages only its marked block in the workspace root.
 
 ### Workflow notes
 
@@ -425,9 +468,9 @@ degrades to "no overrides", never to an unbuildable flake. Overlay children
 need no `.git` and no `flake.nix`, and no canonical-URL state is kept for
 them.
 
-As always, a root `flake.nix` without the `# nws-generated — do not edit`
-header is user-authored and never touched, and identical regenerations are
-skipped byte-for-byte.
+As always, a root `flake.nix` that nws cannot patch safely — unparseable, or
+already declaring its own top-level `inputs`/`outputs` — is logged and left
+untouched, and identical regenerations are skipped byte-for-byte.
 
 ## Shell completion
 
@@ -488,8 +531,10 @@ OK 1
 2. Register an overlay workspace via the CLI:
    `result/bin/nws register /tmp/ros-ws --overlay github:lopsided98/nix-ros-overlay/master --attr-path rosPackages.humble`;
    confirm config.json now contains the overlay workspace object, the
-   generated flake has the managed header, follows the overlay's nixpkgs,
-   and splices a sample package dir at the configured attrPath.
+   generated flake contains the nws block, follows the overlay's nixpkgs,
+   and splices a sample package dir at the configured attrPath. Add a
+   `devShells.<system>.default` below the `# /nws block` line, touch a child
+   dir, and confirm the devShell survives the regeneration.
 3. Register the same workspace with `--resolver /path/to/resolver.sh`; the
    resolver round-trips into config.json (`resolver` field) and the wire
    (`&resolver=` query param).
@@ -550,7 +595,9 @@ Stop with `Ctrl-C`.
 - `src/core/` — importable core logic (`package core`, imported as
   `nwscore:core`):
   - `root_flake.odin` — deterministic root-flake generator, inputs-block
-    parser, managed-header detection.
+    parser, block-boundary detection.
+  - `flake_block.odin` — nws block region finder and flake patcher (the
+    create/inject/update ownership boundary).
   - `git_remote.odin` — fail-open `.git/config` origin parser.
   - `state.odin` — atomic canonical-URL state (`state.json`).
   - `config.odin` — config load/save.

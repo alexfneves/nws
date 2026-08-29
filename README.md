@@ -77,11 +77,23 @@ nws service [--config-path PATH]  run the daemon (watches workspaces, serves the
 nws register [PATH]     add a workspace (default: current directory)
                         overlay options: --overlay URL --attr-path ATTR
                         [--overlay-attr NAME] [--no-flake] [--nixpkgs URL]
-                        [--resolver SCRIPT]
+                        [--resolver SCRIPT] [--dev-shell-packages A,B,C]
 nws unregister [PATH]   remove a workspace
 nws list                list registered workspaces
 nws help                show this help
 ```
+
+For overlay workspaces, `--dev-shell-packages a,b,c` (or
+`"devShellPackages": [...]` in config.json) makes nws generate and maintain a
+`devShells.<system>.default` **inside its managed block**, in the standard
+nix-ros-overlay shape: a `mkShell` wrapping a `buildEnv` env over every
+spliced child (listed first, so local clones win merged collisions) plus the
+listed overlay attrs, with `ignoreCollisions = true`. No shellHook or env
+variables are emitted — the packages' own setup hooks do the wiring. A user
+`devShells.*` written below the `# /nws block` END marker takes precedence
+(nws skips and logs); adding the `# nws devShell block — managed by nws; do
+not edit` / `# /nws devShell block` markers inside your own devShell's `let`
+makes nws manage just that env binding instead.
 
 `register` / `unregister` / `list` are client commands: they connect to the
 daemon's control socket on the **default** port (`127.0.0.1:17424`), so the

@@ -27,8 +27,11 @@ the whole run). From the repo root it:
 5. waits for nws to discover the packages and generate `flake.nix`,
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child),
-7. **holds** — the workspace and daemon stay up and the script prints
-   `cd $WS && nix build`; press **Ctrl+C** to stop the daemon, unregister the
+7. **injects a ROS dev shell** (`devShells.<system>.default`) into the managed
+   flake — the USER LAYER — so `cd $WS && nix develop` gives `rosrun`,
+   `roslaunch`, `roscore` with `ROS_MASTER_URI`/`ROS_PACKAGE_PATH` set,
+8. **holds** — the workspace and daemon stay up and the script prints
+   `cd $WS && nix develop`; press **Ctrl+C** to stop the daemon, unregister the
    workspace and delete the folder (the `clean` trap does it).
 
 ## Run
@@ -57,6 +60,21 @@ daemon keeps watching the workspace and the folder stays on disk. Press
 - Because the local source must match the overlay's pinned deps, the repos are
   cloned from their **ROS1 `noetic` branches**. Cloning `master` would pull ROS2
   source that doesn't match the ROS1/noetic overlay and fails to build.
+
+## The dev shell is a user layer (nws stays generic)
+
+nws intentionally never emits a `devShell` — it owns only the substitution
+machinery (inputs, splice, `packages.<system>`, `default`), and knows nothing
+about ROS or any ecosystem. The ROS dev shell is the **user's responsibility**
+(e.g. you might use `devenv` instead — nws doesn't care).
+
+This example demonstrates that layering: after `nws build`'s generated flake
+lands, `run.sh` injects a `devShells.<system>.default` into `flake.nix` using the
+spliced set's own `buildEnv` combinator + nixpkgs `mkShell`. Because nws
+regenerates `flake.nix` on every fs event in the workspace, a regeneration drops
+the injected block — that is expected. Re-inject by re-running this script, or
+by pasting the `devShells` block from `run.sh`'s `inject_devshell` into
+`flake.nix` yourself.
 
 ## Note
 

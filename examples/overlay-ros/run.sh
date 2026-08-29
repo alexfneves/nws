@@ -23,6 +23,13 @@
 
 set -euo pipefail
 
+# This script uses bashisms (local, $'\n', arrays). Running it via `sh run.sh`
+# (dash) silently breaks the injection. Require bash explicitly.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "ERROR: run this script with bash:  bash $0" >&2
+  exit 1
+fi
+
 # --- resolve paths relative to this script's location (no ~/gits hardcode) ---
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # examples/overlay-ros
 ROOT="$HERE"
@@ -129,11 +136,14 @@ build_devshell_block() {
   local srcs=""
   # every package.xml dir under the workspace — find yields ABSOLUTE paths;
   # bake the package dirs into ROS_PACKAGE_PATH at inject time (the shellHook
-  # runs later with no $WS available). Build a colon-joined quoted list.
+  # runs later with no $WS available). Avoid process substitution so it works
+  # under `sh`/dash too.
   local d
   while IFS= read -r d; do
     srcs+=":\"${d%/*}\""
-  done < <(find "$WS" -name package.xml -type f 2>/dev/null | sort -u)
+  done <<EOSRC
+$(find "$WS" -name package.xml -type f 2>/dev/null | sort -u)
+EOSRC
 
   cat <<EOF
     $mark
@@ -157,43 +167,24 @@ EOF
 inject_devshell() {
   local f="$WS/flake.nix"
   [ -f "$f" ] || return 1
+  grep -qF "$DEV_MARK" "$f" && return 0   # already injected (idempotent)
   local block
   block="$(build_devshell_block "$DEV_MARK" "$SYS")"
-  # replace-idempotent: strip ANY existing devShell output block (marked or
-  # stale — including old `//`-shaped ones) by deleting every line from a
-  # `devShells.` attribute through its matching closing brace, then insert the
-  # fresh block before the LAST closing "  };" of the outputs attrset.
-  python3 - "$f" "$block" <<'PYEOF'
-import re, sys
-f, block = sys.argv[1], sys.argv[2]
-s = open(f).read()
-# remove any existing devShells.<sys>.default = ... ; block (balanced)
-lines = s.split("\n")
-out = []
-i = 0
-while i < len(lines):
-    line = lines[i]
-    if re.match(r"^    devShells\.[A-Za-z0-9_-]+\.default =", line):
-        depth = 0
-        start = i
-        # consume through the matching "    };" at the same nesting as "default = let"
-        while i < len(lines):
-            depth += lines[i].count("{") - lines[i].count("}")
-            if depth <= 0 and re.match(r"^    };", lines[i]):
-                break
-            i += 1
-        i += 1  # skip the closing line too
-        continue
-    out.append(line)
-    i += 1
-s = "\n".join(out) + "\n"
-# insert block before the LAST 2-space closing line of outputs ("  };\n}")
-idx = s.rfind("  };\n}")
-if idx < 0:
-    print("ANCHOR MISSING", file=sys.stderr); sys.exit(1)
-s = s[:idx] + block + "\n" + s[idx:]
-open(f, "w").write(s)
-PYEOF
+  [ -n "$block" ] || return 1
+  # Insert the block before the LAST top-level "  };" (the outputs close).
+  # Pure bash (no python3 / no process substitution / dash-safe). The
+  # workspace flake regenerates to a clean nws form on fs events, so normally
+  # there is no pre-existing devShell to strip; the marker guard above makes
+  # this idempotent on a reused workspace.
+  local anchor total out
+  anchor="$(grep -n '^  };$' "$f" | tail -1 | cut -d: -f1)"
+  total="$(wc -l < "$f")"
+  [ -n "$anchor" ] && [ "$anchor" -gt 0 ] || return 1
+  out="$f.tmp"
+  head -n "$((anchor-1))" "$f" > "$out"
+  printf '%s\n\n' "$block" >> "$out"
+  tail -n "$((total-anchor+1))" "$f" >> "$out"
+  mv "$out" "$f"
 }
 
 # after injecting, assert the flake has exactly one devShell with the ++ shape

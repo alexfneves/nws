@@ -34,11 +34,20 @@ the whole run). From the repo root it:
 5. waits for nws to discover the packages and generate `flake.nix`,
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child),
+6b. **links the compiled C++ node executables** from the built derivations into
+   the source trees under each package's `lib/<pkg>/` (the catkin devel-space
+   layout). `turtlebot3_drive` / `turtlebot3_fake_node` are compiled only by
+   the nix build and never exist in the source clones, so without this step
+   `roslaunch turtlebot3_gazebo turtlebot3_simulation.launch` would fail with
+   `Cannot locate node of type [turtlebot3_drive]`,
 7. **injects a ROS dev shell** (`devShells.<system>.default`) into the
    workspace flake — the USER LAYER — so `cd $WS && nix develop` gives
    `roscore`, `roslaunch`, `rosrun`, `gazebo`, `rviz` with `ROS_MASTER_URI`
    set and `ROS_PACKAGE_PATH` covering: (a) a `buildEnv` of the spliced set's
-   `ros-base` + `gazebo` + `gazebo-ros` + `xacro` + `robot-state-publisher`
+   `ros-base` + `gazebo` + `gazebo-ros` + `gazebo-plugins` + `xacro` +
+   `robot-state-publisher` — `gazebo-plugins` is the ROS1 model-plugin
+   package (diff drive / laser / imu) that the TurtleBot3 URDF loads; it is
+   NOT part of `gazebo-ros`, which only ships the api/paths server plugins
    (so all `$(find ...)` used by the launch resolve), and (b) every local
    clone's source dir. The devShell is written **below the `# /nws block` END
    marker**, inside the outputs return set, so it is ordinary user content
@@ -94,7 +103,7 @@ NIXPKGS_ALLOW_INSECURE=1 nix build --impure       # (run.sh already does this)
 
 ## Running the gazebo simulation
 
-After `run.sh` holds (workspace ready), run in three terminals (the hold keeps
+After `run.sh` holds (workspace ready), run in terminals (the hold keeps
 the daemon but you don't need it for the sim):
 
 ```bash
@@ -110,7 +119,16 @@ roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch
 
 # terminal C — drive it
 roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch
+
+# terminal D — the simple test-drive node (optional; wants B running for odom)
+roslaunch turtlebot3_gazebo turtlebot3_simulation.launch
 ```
+
+`turtlebot3_simulation.launch` runs `turtlebot3_drive`, a **C++** node. The
+dev shell serves the local packages from their **source** dirs, which contain
+no compiled binaries — `run.sh` therefore symlinks the built executables into
+each source clone's `lib/<pkg>/` right after the build (step 6b above), so
+`roslaunch` resolves them the same way it would in a local catkin build.
 
 You now have a gazebo window with a virtual TurtleBot (URDF from
 `turtlebot3-description`) whose odometry/TF update as you teleop.
@@ -127,12 +145,18 @@ shows in the running gazebo, proving the local splice is live.
 `turtlebot3_gazebo`'s launch uses `$(find xacro)`, `$(find gazebo_ros)` and
 `$(find robot_state_publisher)`, but its `package.xml` **only declares**
 `gazebo, gazebo_ros, geometry_msgs, nav_msgs, roscpp, sensor_msgs, std_msgs,
-tf, turtlebot3_description` — i.e. **`xacro` (and `robot_state_publisher`) are
-undeclared launch-time dependencies**. This is an upstream
+tf, turtlebot3_description` — i.e. **`xacro`, `robot_state_publisher`
+**and `gazebo_plugins`** (the package providing `libgazebo_ros_diff_drive.so`
+and friends: without it the robot spawns but nothing subscribes to `/cmd_vel`
+and there is no `/odom` or `/scan`) are undeclared launch-time
+dependencies**. This is an upstream
 `turtlebot3_simulations` bug, not an nws issue. The example's dev shell pulls
 `xacro`/`robot-state-publisher` in anyway (they're normal overlay packages), so
 the launch works; a bare `ros-base` dev shell would hit
-`RLException: ... package 'xacro' not found`.
+`RLException: ... package 'xacro' not found`. `gazebo-plugins` is added to
+the dev shell for the same reason — its absence doesn't abort the launch (the
+model just spawns without any controller), which is why this one is easy to
+miss.
 
 > Teleop: `turtlebot3_teleop` (with `turtlebot3_teleop_key.launch`) is a
 > subpackage of the already-cloned `turtlebot3` repo — the resolver discovers it
@@ -150,12 +174,17 @@ This example demonstrates that layering: nws creates the workspace flake,
 and `run.sh` injects a `devShells.<system>.default` built with
 `nixpkgs.mkShell`, whose build input is a `buildEnv` of the spliced set's
 `ros-base` **plus** the launched-software's `$(find ...)` deps — `gazebo`,
-`gazebo-ros`, `xacro`, `robot-state-publisher` — with a shellHook that
+`gazebo-ros`, `gazebo-plugins`, `xacro`, `robot-state-publisher` — with a
+shellHook that
 sets `ROS_MASTER_URI` and `ROS_PACKAGE_PATH`. `ROS_PACKAGE_PATH` deliberately
 points at the workspace's **local source trees** (all `package.xml` dirs) —
 so `rosrun` finds your locally-cloned packages directly from source, without
 requiring every bare-spliced child to build as a derivation (some monorepo
 subpackages have no declared deps and would fail the debug-output split).
+One consequence: compiled **C++** nodes (e.g. `turtlebot3_drive`) exist only
+in the built derivations, not in the source trees — `run.sh` deals with this
+by symlinking the built executables into the source packages' `lib/<pkg>/`
+dirs (step 6b) so `find_node` still resolves them.
 Because gazebo's `freeimage` gate lives in the overlay's internal nixpkgs,
 enter the shell with `NIXPKGS_ALLOW_INSECURE=1 nix develop --impure` (the
 same reason `run.sh` builds with the env var — see "Why every nix command...").

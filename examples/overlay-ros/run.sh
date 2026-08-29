@@ -8,6 +8,8 @@
 #   4. clone a couple of TurtleBot repos into it
 #   5. wait for nws to generate flake.nix
 #   6. run `nix build` (bare)
+#   6b. link the built C++ node executables into the source trees (catkin
+#       devel-space layout) so roslaunch can resolve them (see below)
 #   7. inject a ROS dev shell (USER LAYER on the managed flake), then HOLD;
 #      pressing Ctrl+C unregisters, stops the daemon and deletes the folder
 #
@@ -158,7 +160,7 @@ EOSRC
       # pkgsN is ONLY used for mkShell (a plain nixpkgs shell builder). The
       # env itself is spliced0.buildEnv over the OVERLAY's packages: ros-base
       # gives roscore/roslaunch/rosrun; gazebo, gazebo-ros, xacro and
-      # robot-state-publisher give the launch-time $(find ...) deps that
+      # robot-state-publisher give the launch-time dependencies that
       # turtlebot3_gazebo's launch uses but does NOT declare.
       #
       # Insecurity gate: gazebo needs nixpkgs' insecure freeimage, and the
@@ -166,8 +168,21 @@ EOSRC
       # permittedInsecurePackages can reach it in a PURE eval. Make sure to
       # enter the shell with:
       #   NIXPKGS_ALLOW_INSECURE=1 nix develop --impure
-      # (the same mechanism run.sh already uses for `nix build` below).
+      # (the same mechanism run.sh already uses for 'nix build' below).
       pkgsN = import inputs.nixpkgs { system = "$sys"; };
+      # Mesa for the Gazebo GUI. gazebo's closure ships only the glvnd GLX
+      # DISPATCHER — the real GL implementation must be a mesa built against
+      # the SAME glibc as the closure, because glvnd dlopens the vendor lib
+      # by name (libGLX_mesa/EGL_mesa). Without this, the vendor dlopen picks
+      # up whatever mesa the OS provides (/run/opengl-driver); when the OS
+      # glibc is NEWER than the overlay pin's (here: system glibc 2.42 vs
+      # closure glibc 2.40), libgallium fails with "GLIBC_ABI_GNU2_TLS not
+      # found" and gzclient segfaults in OGRE ("Unable to create glx visual"
+      # -> Ogre::Root::createRenderWindow). pkgsN imports inputs.nixpkgs
+      # (same nixpkgs as the overlay, via 'nixpkgs.follows'), so pkgsN.mesa
+      # is ABI-compatible with the closure by construction; the shellHook
+      # below routes the GLX/EGL vendor libs + DRI drivers to it.
+      mesa = pkgsN.mesa;
       env = spliced0.buildEnv {
         name = "nws-dev-env";
         # The local children (turtlebot3-gazebo, turtlebot3-description,
@@ -175,12 +190,26 @@ EOSRC
         # to ROS directly from the workspace's own source trees via
         # ROS_PACKAGE_PATH ($srcs), keeping the "edit the URDF and see it in
         # gazebo" demo live.
+        #
+        # gazebo-plugins MUST be here: the ROS1 gazebo_ros stack is split —
+        # gazebo_ros ships only the api/paths SERVER plugins, while the model
+        # plugins the TurtleBot3 URDF loads (libgazebo_ros_diff_drive.so ->
+        # subscriber on /cmd_vel + publisher on /odom, libgazebo_ros_laser.so
+        # -> /scan, libgazebo_ros_imu.so, libgazebo_ros_openni_kinect.so)
+        # live in the sibling gazebo-plugins package (ros-noetic-gazebo-plugins
+        # on Ubuntu). Without it the robot spawns but no controller plugin
+        # loads: nothing subscribes to /cmd_vel, and there is no /odom or
+        # /scan. gazebo_ros's setup hook appends ITS lib to GAZEBO_PLUGIN_PATH
+        # (that's why the api plugin loads); adding gazebo-plugins has its
+        # setup hook append the model plugin libs the same way.
         paths = [
           spliced0.ros-base
           spliced0.gazebo
           spliced0.gazebo-ros
+          spliced0.gazebo-plugins
           spliced0.xacro
           spliced0.robot-state-publisher
+          mesa
         ];
       };
     in pkgsN.mkShell {
@@ -188,6 +217,14 @@ EOSRC
       shellHook = ''
         export ROS_MASTER_URI=http://localhost:11311
         export ROS_PACKAGE_PATH="\${env}/share/ros${srcs}"
+        # Gazebo GUI rendering needs a GLX-capable libGL stack in-process:
+        # hand glvnd the closure-ABI mesa plus its DRI drivers (see above).
+        export LD_LIBRARY_PATH="\${mesa}/lib"
+        export LIBGL_DRIVERS_PATH="\${mesa}/lib/dri"
+        # gazebo 11's GLWidget uses GLX directly; the Qt5 wayland platform
+        # plugin cannot provide a GLX surface (and the GUI segfaults), so use
+        # the xcb (X11/XWayland) plugin for the Qt side of gzclient.
+        export QT_QPA_PLATFORM=xcb
         echo "ROS dev shell ready: rosrun/roslaunch"
       '';
     };
@@ -244,6 +281,60 @@ NIX_BUILD_EXIT=${PIPESTATUS[0]}
 echo "==> nix build finished (exit $NIX_BUILD_EXIT) — continuing regardless"
 set -e
 
+# 6b. Link the compiled C++ node binaries from the built derivations into the
+# source trees under the catkin devel-space layout (lib/<pkg>/<node>).
+#
+# The devShell serves every local package from its SOURCE dir (see above) so
+# URDF/launch edits stay live, but roslaunch resolves node executables by
+# WALKING the resolved package path. turtlebot3_gazebo's C++ test-drive node
+# (turtlebot3_drive) and turtlebot3_fake's fake node exist ONLY as compiled
+# binaries inside the nix-built packages, so without this step
+# `roslaunch turtlebot3_gazebo turtlebot3_simulation.launch` dies with
+# "Cannot locate node of type [turtlebot3_drive] in package [turtlebot3_gazebo]".
+# The bare build's default buildEnv ('result') aggregates every spliced child
+# including their lib/ trees, so symlink each executable into the matching
+# source package's lib/ dir — exactly the layout a local catkin build would
+# produce, and what find_node expects to walk.
+link_nodes_from() {
+  local libdir="$1" src_pkg pkgname b target
+  while IFS= read -r src_pkg; do
+    [ -n "$src_pkg" ] || continue
+    src_pkg="${src_pkg%/package.xml}"
+    pkgname="$(basename "$src_pkg")"
+    [ -d "$libdir/$pkgname" ] || continue
+    mkdir -p "$src_pkg/lib/$pkgname"
+    for b in "$libdir/$pkgname"/*; do
+      [ -f "$b" ] && [ -x "$b" ] || continue
+      case "$b" in *.so*|*.dylib|*.dll) continue ;; esac
+      target="$src_pkg/lib/$pkgname/$(basename "$b")"
+      # never clobber a real source file — only (re)create/repoint symlinks
+      [ -e "$target" ] && [ ! -L "$target" ] && continue
+      ln -sfn "$(readlink -f "$b")" "$target"
+    done
+    echo "    linked built node(s) into $src_pkg/lib/$pkgname"
+  done <<EOP
+$(find "$WS" -name package.xml -type f -not -path "$WS/result/*" 2>/dev/null | sort -u)
+EOP
+}
+link_built_nodes() {
+  if [ -d "$WS/result/lib" ]; then
+    link_nodes_from "$WS/result/lib"
+  else
+    # default buildEnv failed/absent: build the compiled-node children
+    # explicitly (the out-link symlinks root their store paths).
+    local child out
+    for child in turtlebot3-gazebo turtlebot3-fake; do
+      out="$WS/result-$child"
+      if NIXPKGS_ALLOW_INSECURE=1 nix build --impure --extra-experimental-features 'nix-command flakes' ".#$child" --out-link "$out" >/dev/null 2>&1; then
+        link_nodes_from "$out/lib"
+      else
+        echo "    WARN: 'nix build .#$child' failed — its C++ nodes won't be launchable"
+      fi
+    done
+  fi
+}
+link_built_nodes
+
 # 7. everything is up — hand the workspace to the user.
 # nws regenerates ONLY its own block on fs events; the user's devShell and the
 # file's closing braces live outside it and persist. Edit the devShell (or add
@@ -256,6 +347,8 @@ echo "==> Workspace ready at:    $WS"
 echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
 echo
 echo "==> Run the GAZEBO simulation (see README):"
+echo "    # (the dev shell now also provides a closure-ABI mesa so the gazebo GUI renders;"
+echo "    #  the first 'nix develop' fetches/builds it)"
 echo "    # The dev shell needs the same insecure-allow as the build:"
 echo "    #   NIXPKGS_ALLOW_INSECURE=1 nix develop --impure"
 echo "    # (the freeimage gate lives in the overlay's internal nixpkgs and can"
@@ -267,6 +360,12 @@ echo "    roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch"
 echo "        # terminal B: gazebo starts with the virtual turtlebot"
 echo "    roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch"
 echo "        # terminal C: drive it (arrow keys)"
+echo "    roslaunch turtlebot3_gazebo turtlebot3_simulation.launch"
+echo "        # terminal D: the simple test-drive node (turtlebot3_drive)"
+echo "        # C++ nodes exist only as compiled binaries in the nix-built packages,"
+echo "        # not in the source trees served on ROS_PACKAGE_PATH — run.sh symlinks"
+echo "        # them into lib/<pkg>/ of each source clone (catkin devel-space layout)"
+echo "        # right after the build, so roslaunch finds them."
 echo
 echo "==> The two local clones are: turtlebot3 (URDF/description) +"
 echo "    turtlebot3_simulations (main gazebo launch). Edit e.g."
@@ -274,8 +373,11 @@ echo "    $WS/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger.urdf.xacr
 echo "    (change a <material> colour) and rerun the launch — the change is"
 echo "    visible in the running simulation, proving your spliced package is"
 echo "    the one gazebo uses."
-echo "==> All other deps (gazebo, gazebo_ros, xacro, robot_state_publisher,"
-echo "    msgs, ...) are installed automatically by the nix build."
+echo "==> All other deps (gazebo, gazebo_ros, gazebo_plugins — the model"
+echo "    plugins: diff drive / laser / imu that the URDF loads — xacro,"
+echo "    robot_state_publisher, msgs, ...) are installed by the nix build /"
+echo "    dev shell; gazebo-plugins is what makes /cmd_vel (and /odom, /scan)"
+echo "    work in gazebo."
 echo
 echo "==> Press Ctrl+C to stop the daemon and delete the workspace."
 while true; do

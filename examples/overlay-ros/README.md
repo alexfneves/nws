@@ -38,12 +38,11 @@ the whole run). From the repo root it:
    workspace flake — the USER LAYER — so `cd $WS && nix develop` gives
    `roscore`, `roslaunch`, `rosrun`, `gazebo`, `rviz` with `ROS_MASTER_URI`
    set and `ROS_PACKAGE_PATH` covering: (a) a `buildEnv` of the spliced set's
-   `ros-base` + `gazebo` + `gazebo-ros` + `xacro` + `robot-state-publisher` +
-   `turtlebot3-gazebo` + `turtlebot3-description` + `turtlebot3` (so all
-   `$(find ...)` used by the launch resolve), and (b) every local clone's
-   source dir. The devShell is written **below the `# /nws block` END
+   `ros-base` + `gazebo` + `gazebo-ros` + `xacro` + `robot-state-publisher`
+   (so all `$(find ...)` used by the launch resolve), and (b) every local
+   clone's source dir. The devShell is written **below the `# /nws block` END
    marker**, inside the outputs return set, so it is ordinary user content
-   and survives every nws regeneration,
+   and survives every nws regeneration.
 8. **holds** — the workspace and daemon stay up and the script prints
    `cd $WS && nix develop`; press **Ctrl+C** to stop the daemon, unregister the
    workspace and delete the folder (the `clean` trap does it).
@@ -60,6 +59,24 @@ It prints the generated `flake.nix` header and the number of spliced children,
 then runs the build. After a successful build the script **holds**: the
 daemon keeps watching the workspace and the folder stays on disk. Press
 **Ctrl+C** to clean up (stop daemon, unregister, delete the workspace).
+
+### Why every nix command needs `NIXPKGS_ALLOW_INSECURE=1 --impure`
+
+The gazebo stack depends on `freeimage`, which this nixpkgs pin marks
+**insecure** and refuses to evaluate. The gate lives inside the **overlay
+flake's own nixpkgs import** — i.e. code outside this workspace's flake — so
+no flake-local `permittedInsecurePackages` can lift it for the packages the
+example needs (turtlebot3_gazebo's spliced child, and the devShell's gazebo
+env). The only mechanism that reaches it is nixpkgs' documented env var,
+which requires `--impure`:
+
+```bash
+NIXPKGS_ALLOW_INSECURE=1 nix develop --impure    # shell
+NIXPKGS_ALLOW_INSECURE=1 nix build --impure       # (run.sh already does this)
+```
+
+`run.sh` already runs its build this way; you only need it for your own
+`nix develop`/`nix build` invocations.
 
 ## How it works
 
@@ -83,15 +100,15 @@ the daemon but you don't need it for the sim):
 ```bash
 # terminal A — the ROS master
 export TURTLEBOT3_MODEL=burger        # or waffle / waffle_pi
-cd <ws> && nix develop
+cd <ws> && NIXPKGS_ALLOW_INSECURE=1 nix develop --impure
 roscore
 
 # terminal B — start gazebo with the virtual turtlebot
 export TURTLEBOT3_MODEL=burger
-cd <ws> && nix develop
+cd <ws> && NIXPKGS_ALLOW_INSECURE=1 nix develop --impure
 roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch
 
-# terminal C — drive it (needs one extra clone, see below)
+# terminal C — drive it
 roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch
 ```
 
@@ -131,13 +148,17 @@ responsibility** (e.g. you might use `devenv` instead — nws doesn't care).
 
 This example demonstrates that layering: nws creates the workspace flake,
 and `run.sh` injects a `devShells.<system>.default` built with
-`nixpkgs.mkShell`, whose build input is the spliced set's **`ros-base`
-`buildEnv`** (provides `roscore`/`roslaunch`/`rosrun`), with a shellHook that
+`nixpkgs.mkShell`, whose build input is a `buildEnv` of the spliced set's
+`ros-base` **plus** the launched-software's `$(find ...)` deps — `gazebo`,
+`gazebo-ros`, `xacro`, `robot-state-publisher` — with a shellHook that
 sets `ROS_MASTER_URI` and `ROS_PACKAGE_PATH`. `ROS_PACKAGE_PATH` deliberately
 points at the workspace's **local source trees** (all `package.xml` dirs) —
 so `rosrun` finds your locally-cloned packages directly from source, without
 requiring every bare-spliced child to build as a derivation (some monorepo
 subpackages have no declared deps and would fail the debug-output split).
+Because gazebo's `freeimage` gate lives in the overlay's internal nixpkgs,
+enter the shell with `NIXPKGS_ALLOW_INSECURE=1 nix develop --impure` (the
+same reason `run.sh` builds with the env var — see "Why every nix command...").
 
 The devShell is injected **below the `# /nws block` END marker**, i.e. inside
 the flake's `outputs` return set but outside the region nws owns. nws

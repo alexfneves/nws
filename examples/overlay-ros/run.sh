@@ -100,20 +100,26 @@ git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3_si
 git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3.git turtlebot3
 echo "==> cloned repos (noetic branches)"
 
-# 5. wait for nws to discover at least ONE child, so the flake has a
-# substitution set to build/dev against. (Do not gate on a specific monorepo
-# subpackage — discovery can be slow and 1 child is enough to proceed.)
-for i in $(seq 1 120); do
-  if [ -f "$WS/flake.nix" ] && [ "$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null)" -ge 1 ]; then
-    break
-  fi
-  # poke an fs event so a late clone/checkout is noticed
-  find "$WS" -name package.xml -exec touch {} \; 2>/dev/null || true
+# 5. wait for nws to discover the FULL clone set (this is the number of
+# NAME<tab>RELPATH lines the resolver emits over the finished clones), so the
+# generated flake splices every package — a partial set would silently fall
+# back to upstream packages for the missing ones.
+EXPECTED=$(bash "$RESOLVER" "$WS" | wc -l)
+echo "==> resolver emits $EXPECTED packages; waiting for the daemon to splice them all..."
+for i in $(seq 1 180); do
+  HAVE=$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null || echo 0)
+  if [ "$HAVE" -ge "$EXPECTED" ]; then break; fi
+  # The daemon watches ONLY the workspace ROOT (inotify is not recursive):
+  # deep file changes (touching package.xml inside a clone) wake nothing.
+  # Touch the root's own flake.nix instead — an ATTRIB/CLOSE_WRITE event on
+  # a root entry that always fires. Byte-equal skip makes it harmless.
+  touch "$WS/flake.nix" 2>/dev/null || true
   sleep 0.5
+  if [ $((i % 20)) -eq 0 ]; then echo "    ...$HAVE/$EXPECTED spliced so far"; fi
 done
 sleep 1   # let the daemon finish a regen after the last event
 # force one final regeneration (full clone set present now)
-find "$WS" -name package.xml -exec touch {} \; 2>/dev/null || true
+touch "$WS/flake.nix" 2>/dev/null || true
 sleep 1
 echo "==> generated flake.nix"
 sed -n '1,8p' "$WS/flake.nix"
@@ -149,27 +155,32 @@ EOSRC
   cat <<EOF
     $mark
     devShells.$sys.default = let
-      # nixpkgs imported WITH the gazebo/freeimage insecurity gate lifted:
-      # the gazebo stack transitively needs the insecure `freeimage`, which
-      # nixpkgs refuses by default. We allow exactly it (and its known CVEs)
-      # here so the simulation can actually evaluate.
-      pkgsN = import inputs.nixpkgs {
-        system = "$sys";
-        config.permittedInsecurePackages = [
-          "freeimage-3.18.0-unstable-2024-04-18"
-        ];
-      };
-      env = pkgsN.buildEnv {
+      # pkgsN is ONLY used for mkShell (a plain nixpkgs shell builder). The
+      # env itself is spliced0.buildEnv over the OVERLAY's packages: ros-base
+      # gives roscore/roslaunch/rosrun; gazebo, gazebo-ros, xacro and
+      # robot-state-publisher give the launch-time $(find ...) deps that
+      # turtlebot3_gazebo's launch uses but does NOT declare.
+      #
+      # Insecurity gate: gazebo needs nixpkgs' insecure freeimage, and the
+      # gate lives in the OVERLAY flake's own nixpkgs import — no flake-local
+      # permittedInsecurePackages can reach it in a PURE eval. Make sure to
+      # enter the shell with:
+      #   NIXPKGS_ALLOW_INSECURE=1 nix develop --impure
+      # (the same mechanism run.sh already uses for `nix build` below).
+      pkgsN = import inputs.nixpkgs { system = "$sys"; };
+      env = spliced0.buildEnv {
         name = "nws-dev-env";
+        # The local children (turtlebot3-gazebo, turtlebot3-description,
+        # turtlebot3, ...) are deliberately NOT built here — they are served
+        # to ROS directly from the workspace's own source trees via
+        # ROS_PACKAGE_PATH ($srcs), keeping the "edit the URDF and see it in
+        # gazebo" demo live.
         paths = [
           spliced0.ros-base
-          pkgsN.gazebo
-          pkgsN.gazebo-ros
-          pkgsN.xacro
-          pkgsN.robot-state-publisher
-          spliced0.turtlebot3-gazebo
-          spliced0.turtlebot3-description
-          spliced0.turtlebot3
+          spliced0.gazebo
+          spliced0.gazebo-ros
+          spliced0.xacro
+          spliced0.robot-state-publisher
         ];
       };
     in pkgsN.mkShell {
@@ -218,11 +229,19 @@ fi
 # subpackages have no declared deps and fail the debug-output split. That does
 # NOT block the dev shell (injected above), so do NOT let a build failure abort
 # the script (pipefail would) — the dev shell and `nix develop` are the point.
+#
+# Insecure-package gate: turtlebot3_gazebo (a spliced child) depends on the
+# gazebo stack, which needs nixpkgs' insecure `freeimage`. The gate lives in
+# the OVERLAY's own nixpkgs import — flake-level `permittedInsecurePackages`
+# cannot reach it. The documented nixpkgs mechanism is NIXPKGS_ALLOW_INSECURE
+# + --impure, which every nixpkgs import in the eval honors. `nix develop`
+# needs the same treatment (see the banner below).
 cd "$WS"
-echo "==> nix build ..."
+echo "==> nix build ... (NIXPKGS_ALLOW_INSECURE=1 --impure: lifts the freeimage gate for the overlay's internal nixpkgs)"
 set +e
-nix build --extra-experimental-features 'nix-command flakes' 2>&1 | tail -20
-echo "==> nix build finished (exit ${PIPESTATUS[0]}) — continuing regardless"
+NIXPKGS_ALLOW_INSECURE=1 nix build --impure --extra-experimental-features 'nix-command flakes' 2>&1 | tail -20
+NIX_BUILD_EXIT=${PIPESTATUS[0]}
+echo "==> nix build finished (exit $NIX_BUILD_EXIT) — continuing regardless"
 set -e
 
 # 7. everything is up — hand the workspace to the user.
@@ -237,12 +256,15 @@ echo "==> Workspace ready at:    $WS"
 echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
 echo
 echo "==> Run the GAZEBO simulation (see README):"
-echo "    # terminal 1 (this hold keeps the daemon; run these in OTHER terminals)"
+echo "    # The dev shell needs the same insecure-allow as the build:"
+echo "    #   NIXPKGS_ALLOW_INSECURE=1 nix develop --impure"
+echo "    # (the freeimage gate lives in the overlay's internal nixpkgs and can"
+echo "    # only be lifted via the env var + --impure, not via flake content)"
 echo "    export TURTLEBOT3_MODEL=burger   # or waffle / waffle_pi"
-echo "    cd $WS && nix develop                  # into the ROS dev shell"
+echo "    cd $WS && NIXPKGS_ALLOW_INSECURE=1 nix develop --impure   # into the ROS dev shell"
 echo "    roscore                                 # terminal A: master"
 echo "    roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch"
-echo "        # terminals B: gazebo starts with the virtual turtlebot"
+echo "        # terminal B: gazebo starts with the virtual turtlebot"
 echo "    roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch"
 echo "        # terminal C: drive it (arrow keys)"
 echo

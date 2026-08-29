@@ -113,6 +113,80 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
 	)
 }
 
+// The block form carries exactly the whole-file body between the markers:
+// BEGIN on its own line, then the identical inner text (inputs + outputs
+// sections), then END on its own line. Every binding name stays put
+// (`spliced0`, `childCalls0`, `base0`, `overlay0`, `nixpkgs`, `inputs`) so
+// user attrs referencing block internals survive regeneration.
+@(test)
+test_overlay_flake_block_golden :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child {
+		{name = "tf2_msgs", rel_path = "ros/tf2_msgs"},
+		{name = "tf2", rel_path = "tf2"},
+	}
+
+	block := core.generate_overlay_block(children, cfg)
+	defer delete(block)
+	whole := core.generate_overlay_root_flake(children, cfg)
+	defer delete(whole)
+
+	testing.expectf(
+		t,
+		strings.has_prefix(block, block_prefix),
+		"block must open with the BEGIN marker:\n%s",
+		block,
+	)
+	testing.expectf(
+		t,
+		strings.has_suffix(block, block_suffix),
+		"block must close with the END marker:\n%s",
+		block,
+	)
+
+	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	testing.expectf(
+		t,
+		inner == body,
+		"block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
+		inner,
+		body,
+	)
+
+	// Stable binding names (ISC-7): user attrs reference these across regens.
+	bindings := []string{"spliced0", "childCalls0", "base0", "overlay0", "nixpkgs", "inputs"}
+	for name in bindings {
+		testing.expectf(t, strings.contains(inner, name), "binding %q missing from block", name)
+	}
+}
+
+// Empty children: the block still carries the minimal body (`outputs = { ...
+// }: {};`) between its markers.
+@(test)
+test_overlay_flake_block_empty_children :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+
+	block := core.generate_overlay_block(nil, cfg)
+	defer delete(block)
+	whole := core.generate_overlay_root_flake(nil, cfg)
+	defer delete(whole)
+
+	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	testing.expectf(
+		t,
+		inner == body,
+		"empty block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
+		inner,
+		body,
+	)
+	testing.expectf(t, strings.has_prefix(block, block_prefix), "BEGIN marker missing")
+	testing.expectf(t, strings.has_suffix(block, block_suffix), "END marker missing")
+}
+
 // Calling twice with equal inputs yields byte-identical output regardless of
 // child order.
 @(test)

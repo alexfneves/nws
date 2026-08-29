@@ -25,7 +25,10 @@ MANAGED_ROOT_HEADER :: "# nws-generated — do not edit"
 // generate_root_flake builds a complete, syntactically valid workspace root
 // flake.nix from the given children. It is a pure function of its arguments:
 // children are emitted sorted by name regardless of input order, so calling
-// it twice with equal inputs yields byte-identical output.
+// it twice with equal inputs yields byte-identical output. The whole-file
+// form wraps the nws body (see write_root_body and generate_root_block) in
+// the managed header and the top-level `{ ... }` scaffold; the body itself is
+// byte-identical to the block form's inner text.
 //
 // Each cloned child becomes `inputs.<name>.url = "path:./<name>"` with an
 // optional `# nws: <canonical-url>` marker comment (same semantics as
@@ -36,48 +39,91 @@ MANAGED_ROOT_HEADER :: "# nws-generated — do not edit"
 // `<child>-` prefixed attribute names, which makes `.default` collisions
 // impossible by construction.
 generate_root_flake :: proc(children: []Child_Info, allocator := context.allocator) -> string {
-	sorted := make([dynamic]Child_Info, 0, len(children), allocator)
+	sorted := sorted_children(children, allocator)
 	defer delete(sorted)
-	for c in children {
-		append(&sorted, c)
-	}
-	// Sort by name so output bytes never depend on directory enumeration order.
-	slice.sort_by(sorted[:], proc(a, b: Child_Info) -> bool {
-		return a.name < b.name
-	})
 
 	b := strings.builder_make(allocator)
 	defer strings.builder_destroy(&b)
 
 	strings.write_string(&b, MANAGED_ROOT_HEADER)
 	strings.write_string(&b, "\n{\n")
-	if len(sorted) > 0 {
-		strings.write_string(&b, "  inputs = {\n")
-		for c in sorted {
-			strings.write_string(&b, "    ")
-			write_attr_key(&b, c.name)
-			strings.write_string(&b, `.url = "path:./`)
-			nix_escape_string(&b, c.name)
-			strings.write_string(&b, `";`)
-			if c.has_url {
-				// Same `# nws: <canonical>` marker semantics as flake.odin;
-				// emitted exactly once because we always generate fresh text.
-				strings.write_string(&b, ` # nws: `)
-				strings.write_string(&b, c.url)
-			}
-			strings.write_string(&b, "\n")
-			emit_sibling_overrides(&b, c, sorted[:])
-		}
-		strings.write_string(&b, "  };\n")
-	} else {
-		// Minimal valid empty managed flake.
-		strings.write_string(&b, "  inputs = {};\n")
-	}
-
-	root_flake_outputs(&b, sorted[:])
+	write_root_body(&b, sorted[:])
 	strings.write_string(&b, "}\n")
 
 	return strings.clone(strings.to_string(b), allocator)
+}
+
+// generate_root_block builds the nws-managed block for a flake-delegation
+// workspace: exactly the body emitted by generate_root_flake (the `inputs`
+// section with sibling overrides plus the delegated `outputs`, binding names
+// unchanged) wrapped in the NWS_BLOCK_BEGIN…NWS_BLOCK_END markers instead of
+// the whole-file header and outer braces. The daemon injects or updates this
+// block inside a user-owned flake; user content outside the markers is never
+// touched. Pure and deterministic like the whole-file form; the returned
+// string is allocated from `allocator` and owned by the caller.
+generate_root_block :: proc(children: []Child_Info, allocator := context.allocator) -> string {
+	sorted := sorted_children(children, allocator)
+	defer delete(sorted)
+
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+
+	strings.write_string(&b, NWS_BLOCK_BEGIN)
+	strings.write_string(&b, "\n")
+	write_root_body(&b, sorted[:])
+	strings.write_string(&b, NWS_BLOCK_END)
+	strings.write_string(&b, "\n")
+
+	return strings.clone(strings.to_string(b), allocator)
+}
+
+// sorted_children returns children sorted by name so output bytes never
+// depend on directory enumeration order. The returned slice is allocated
+// from allocator, owned by the caller, and shares nothing with children.
+sorted_children :: proc(
+	children: []Child_Info,
+	allocator := context.allocator,
+) -> [dynamic]Child_Info {
+	sorted := make([dynamic]Child_Info, 0, len(children), allocator)
+	for c in children {
+		append(&sorted, c)
+	}
+	slice.sort_by(sorted[:], proc(a, b: Child_Info) -> bool {
+		return a.name < b.name
+	})
+	return sorted
+}
+
+// write_root_body writes the nws-owned body of a flake-delegation root flake:
+// the `inputs` section (with sibling overrides) followed by the delegated
+// `outputs` — everything that lives between the top-level `{` and `}` of the
+// whole-file form and, byte-identically, between the block markers of the
+// block form. Zero children yields the minimal `inputs = {};` plus the empty
+// delegation.
+write_root_body :: proc(b: ^strings.Builder, sorted: []Child_Info) {
+	if len(sorted) > 0 {
+		strings.write_string(b, "  inputs = {\n")
+		for c in sorted {
+			strings.write_string(b, "    ")
+			write_attr_key(b, c.name)
+			strings.write_string(b, `.url = "path:./`)
+			nix_escape_string(b, c.name)
+			strings.write_string(b, `";`)
+			if c.has_url {
+				// Same `# nws: <canonical>` marker semantics as flake.odin;
+				// emitted exactly once because we always generate fresh text.
+				strings.write_string(b, ` # nws: `)
+				strings.write_string(b, c.url)
+			}
+			strings.write_string(b, "\n")
+			emit_sibling_overrides(b, c, sorted)
+		}
+		strings.write_string(b, "  };\n")
+	} else {
+		// Minimal valid empty managed flake.
+		strings.write_string(b, "  inputs = {};\n")
+	}
+	root_flake_outputs(b, sorted)
 }
 
 // root_flake_outputs emits the `outputs` section delegating the children's

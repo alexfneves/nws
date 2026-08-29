@@ -4,6 +4,14 @@ import "core:strings"
 import "core:testing"
 import "nwscore:core"
 
+// Whole-file / block wrappers shared by the block-emission tests: stripping
+// these from a generated string yields the bare nws body, so the block form
+// and the whole-file form can be compared inner-to-inner.
+whole_file_prefix :: "# nws-generated — do not edit\n{\n"
+whole_file_suffix :: "}\n"
+block_prefix :: core.NWS_BLOCK_BEGIN + "\n"
+block_suffix :: core.NWS_BLOCK_END + "\n"
+
 // Golden exact-string output for a representative, deliberately unsorted set
 // of children: one without a canonical URL (no marker) and two with URLs.
 @(test)
@@ -63,6 +71,75 @@ test_root_flake_golden :: proc(t: ^testing.T) {
 
 	// The generated text must itself be a managed root.
 	testing.expectf(t, core.is_managed_root(got), "generated flake should be detected as managed")
+}
+
+// The block form carries exactly the whole-file body between the markers:
+// BEGIN on its own line, then the identical inner text (inputs + delegated
+// outputs), then END on its own line. Binding names are unchanged, so user
+// attrs referencing the delegation survive regeneration.
+@(test)
+test_root_flake_block_golden :: proc(t: ^testing.T) {
+	children := []core.Child_Info {
+		{name = "zeta", url = "https://github.com/user/zeta", has_url = true},
+		{name = "alpha", has_url = false},
+		{name = "mid", url = "https://github.com/user/mid repo", has_url = true},
+	}
+
+	block := core.generate_root_block(children)
+	defer delete(block)
+	whole := core.generate_root_flake(children)
+	defer delete(whole)
+
+	testing.expectf(
+		t,
+		strings.has_prefix(block, block_prefix),
+		"block must open with the BEGIN marker:\n%s",
+		block,
+	)
+	testing.expectf(
+		t,
+		strings.has_suffix(block, block_suffix),
+		"block must close with the END marker:\n%s",
+		block,
+	)
+
+	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	testing.expectf(
+		t,
+		inner == body,
+		"block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
+		inner,
+		body,
+	)
+
+	// Stable binding names (ISC-7): user attrs reference these across regens.
+	bindings := []string{"inputs", "children", "delegate", "perSystem"}
+	for name in bindings {
+		testing.expectf(t, strings.contains(inner, name), "binding %q missing from block", name)
+	}
+}
+
+// Empty children: the block still carries the minimal body (`inputs = {}`
+// plus the empty delegation) between its markers.
+@(test)
+test_root_flake_block_empty_children :: proc(t: ^testing.T) {
+	block := core.generate_root_block(nil)
+	defer delete(block)
+	whole := core.generate_root_flake(nil)
+	defer delete(whole)
+
+	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	testing.expectf(
+		t,
+		inner == body,
+		"empty block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
+		inner,
+		body,
+	)
+	testing.expectf(t, strings.has_prefix(block, block_prefix), "BEGIN marker missing")
+	testing.expectf(t, strings.has_suffix(block, block_suffix), "END marker missing")
 }
 
 // Generating twice with identical inputs must produce byte-identical output.

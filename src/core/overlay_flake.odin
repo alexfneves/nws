@@ -20,7 +20,10 @@ Overlay_Child :: struct {
 // outputs, falling back to the imported overlay source) and splices the
 // matched children into that set via `overrideScope'` when it is a fixpoint
 // scope (so shadowing propagates to consumers), or a plain attrset merge
-// otherwise.
+// otherwise. The whole-file form wraps the nws body (see write_overlay_body
+// and generate_overlay_block) in the managed header and the top-level
+// `{ ... }` scaffold; the body itself is byte-identical to the block form's
+// inner text.
 //
 // Like generate_root_flake this is a pure function of its arguments: children
 // are emitted sorted by name (ties broken by rel_path), everything is written
@@ -45,6 +48,61 @@ generate_overlay_root_flake :: proc(
 	cfg: Workspace_Config,
 	allocator := context.allocator,
 ) -> string {
+	emit := overlay_emit_children(matched, allocator)
+	defer delete(emit)
+
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+
+	strings.write_string(&b, MANAGED_ROOT_HEADER)
+	strings.write_string(&b, "\n{\n")
+	write_overlay_body(&b, emit[:], cfg)
+	strings.write_string(&b, "}\n")
+
+	return strings.clone(strings.to_string(b), allocator)
+}
+
+// generate_overlay_block builds the nws-managed block for an overlay
+// workspace: exactly the body emitted by generate_overlay_root_flake —
+// binding names preserved (`spliced0`, `childCalls0`, `base0`, `overlay0`,
+// `nixpkgs`, `inputs`) so user attrs referencing block internals survive
+// regeneration — wrapped in the NWS_BLOCK_BEGIN…NWS_BLOCK_END markers instead
+// of the whole-file header and outer braces. The daemon injects or updates
+// this block inside a user-owned flake; user content outside the markers is
+// never touched. Pure and deterministic like the whole-file form; the
+// returned string is allocated from `allocator` and owned by the caller.
+generate_overlay_block :: proc(
+	matched: []Overlay_Child,
+	cfg: Workspace_Config,
+	allocator := context.allocator,
+) -> string {
+	emit := overlay_emit_children(matched, allocator)
+	defer delete(emit)
+
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+
+	strings.write_string(&b, NWS_BLOCK_BEGIN)
+	strings.write_string(&b, "\n")
+	write_overlay_body(&b, emit[:], cfg)
+	strings.write_string(&b, NWS_BLOCK_END)
+	strings.write_string(&b, "\n")
+
+	return strings.clone(strings.to_string(b), allocator)
+}
+
+// overlay_emit_children returns matched children sorted by name (ties broken
+// by rel_path) with any child whose name or rel_path cannot be emitted as a
+// bare Nix path token dropped (see is_path_token_safe), so the generated
+// flake stays evaluable. Such paths (spaces, quotes, backslashes, `#`, `${`,
+// control chars, or empty) simply cannot be represented and are omitted from
+// childCalls, packages.<system> and default alike rather than breaking every
+// generated flake. The returned slice is allocated from allocator, owned by
+// the caller, and shares nothing with matched.
+overlay_emit_children :: proc(
+	matched: []Overlay_Child,
+	allocator := context.allocator,
+) -> [dynamic]Overlay_Child {
 	sorted := make([dynamic]Overlay_Child, 0, len(matched), allocator)
 	defer delete(sorted)
 	for c in matched {
@@ -57,33 +115,26 @@ generate_overlay_root_flake :: proc(
 		return a.rel_path < b.rel_path
 	})
 
-	// A child whose name or rel_path cannot be written as a bare Nix path
-	// token is skipped — omitted from childCalls, packages.<system> and default
-	// alike — so the generated flake stays evaluable. Such paths (spaces,
-	// quotes, backslashes, `#`, `${`, control chars, or empty) simply cannot be
-	// represented and are dropped rather than breaking every generated flake.
 	emit := make([dynamic]Overlay_Child, 0, len(sorted), allocator)
-	defer delete(emit)
 	for c in sorted {
 		if is_path_token_safe(c.rel_path) && is_path_token_safe(c.name) {
 			append(&emit, c)
 		}
 	}
+	return emit
+}
 
+// write_overlay_body writes the nws-owned body of an overlay root flake:
+// everything that lives between the top-level `{` and `}` of the whole-file
+// form — and, byte-identically, between the NWS_BLOCK_BEGIN/NWS_BLOCK_END
+// markers of the block form. Zero safe children yields the minimal valid
+// body `outputs = { ... }: {};`.
+write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Workspace_Config) {
 	// Zero safe children: minimal valid managed flake (still passes is_managed_root).
 	if len(emit) == 0 {
-		b := strings.builder_make(allocator)
-		defer strings.builder_destroy(&b)
-		strings.write_string(&b, MANAGED_ROOT_HEADER)
-		strings.write_string(&b, "\n{\n  outputs = { ... }: {};\n}\n")
-		return strings.clone(strings.to_string(b), allocator)
+		strings.write_string(b, "  outputs = { ... }: {};\n")
+		return
 	}
-
-	b := strings.builder_make(allocator)
-	defer strings.builder_destroy(&b)
-
-	strings.write_string(&b, MANAGED_ROOT_HEADER)
-	strings.write_string(&b, "\n{\n")
 
 	// --- inputs section ---
 	flake_count := 0
@@ -92,36 +143,36 @@ generate_overlay_root_flake :: proc(
 			continue
 		}
 		if flake_count == 0 {
-			strings.write_string(&b, "  inputs = {\n")
+			strings.write_string(b, "  inputs = {\n")
 		}
-		strings.write_string(&b, "    ")
-		write_input_name(&b, flake_count)
-		strings.write_string(&b, `.url = "`)
-		nix_escape_string(&b, ov.url)
-		strings.write_string(&b, "\";\n")
+		strings.write_string(b, "    ")
+		write_input_name(b, flake_count)
+		strings.write_string(b, `.url = "`)
+		nix_escape_string(b, ov.url)
+		strings.write_string(b, "\";\n")
 		flake_count += 1
 	}
 	use_follows := false
 	if len(cfg.nixpkgs_url) > 0 {
 		if flake_count == 0 {
-			strings.write_string(&b, "  inputs = {\n")
+			strings.write_string(b, "  inputs = {\n")
 		}
-		strings.write_string(&b, `    nixpkgs.url = "`)
-		nix_escape_string(&b, cfg.nixpkgs_url)
-		strings.write_string(&b, "\";\n")
+		strings.write_string(b, `    nixpkgs.url = "`)
+		nix_escape_string(b, cfg.nixpkgs_url)
+		strings.write_string(b, "\";\n")
 	} else if flake_count > 0 {
 		// Cascade step 2: follow the first flake overlay's nixpkgs.
 		use_follows = true
-		strings.write_string(&b, "    nixpkgs.follows = \"")
-		write_input_name(&b, 0)
-		strings.write_string(&b, "/nixpkgs\";\n")
+		strings.write_string(b, "    nixpkgs.follows = \"")
+		write_input_name(b, 0)
+		strings.write_string(b, "/nixpkgs\";\n")
 	}
 	if flake_count > 0 || len(cfg.nixpkgs_url) > 0 {
-		strings.write_string(&b, "  };\n")
+		strings.write_string(b, "  };\n")
 	}
 
 	// --- outputs section ---
-	strings.write_string(&b, "  outputs = { ... }@inputs:\n  let\n")
+	strings.write_string(b, "  outputs = { ... }@inputs:\n  let\n")
 	// Base-set resolution per entry: prefer the attrPath on the flake input
 	// itself (nix-ros-overlay-style flakes expose e.g.
 	// legacyPackages.<system>.<distro> directly as outputs), falling back to
@@ -132,57 +183,57 @@ generate_overlay_root_flake :: proc(
 		if len(ap_i) == 0 {
 			ap_i = "pkgs"
 		}
-		strings.write_string(&b, "    baseViaInput")
-		write_int(&b, i)
-		strings.write_string(&b, " = ")
+		strings.write_string(b, "    baseViaInput")
+		write_int(b, i)
+		strings.write_string(b, " = ")
 		if cfg.overlays[i].is_flake {
-			strings.write_string(&b, "inputs.")
-			write_input_name(&b, i)
-			strings.write_byte(&b, '.')
-			write_attr_path(&b, ap_i)
-			strings.write_string(&b, " or null;\n")
-			strings.write_string(&b, "    overlaySource")
-			write_int(&b, i)
-			strings.write_string(&b, " = import inputs.")
-			write_input_name(&b, i)
-			strings.write_string(&b, ";\n")
+			strings.write_string(b, "inputs.")
+			write_input_name(b, i)
+			strings.write_byte(b, '.')
+			write_attr_path(b, ap_i)
+			strings.write_string(b, " or null;\n")
+			strings.write_string(b, "    overlaySource")
+			write_int(b, i)
+			strings.write_string(b, " = import inputs.")
+			write_input_name(b, i)
+			strings.write_string(b, ";\n")
 		} else {
 			// Non-flake entry: plain expression fetched as a tarball (ISC-13);
 			// there is no flake output to consult directly.
-			strings.write_string(&b, "null;\n")
-			strings.write_string(&b, "    overlaySource")
-			write_int(&b, i)
-			strings.write_string(&b, " = ")
-			strings.write_string(&b, `import (builtins.fetchTarball "`)
-			nix_escape_string(&b, cfg.overlays[i].url)
-			strings.write_string(&b, "\");\n")
+			strings.write_string(b, "null;\n")
+			strings.write_string(b, "    overlaySource")
+			write_int(b, i)
+			strings.write_string(b, " = ")
+			strings.write_string(b, `import (builtins.fetchTarball "`)
+			nix_escape_string(b, cfg.overlays[i].url)
+			strings.write_string(b, "\");\n")
 		}
 		// Overlay sources come in two shapes: a function returning an
 		// already-overlaid pkgs set (e.g. nix-ros-overlay's default.nix) or a
 		// ready set. A system argument is required under flake eval because
 		// builtins.currentSystem is unavailable.
-		strings.write_string(&b, "    overlayResolved")
-		write_int(&b, i)
-		strings.write_string(&b, " = if builtins.isFunction overlaySource")
-		write_int(&b, i)
-		strings.write_string(&b, " then overlaySource")
-		write_int(&b, i)
-		strings.write_string(&b, " { system = \"")
-		strings.write_string(&b, system_from_attr_path(ap_i))
-		strings.write_string(&b, "\"; } else overlaySource")
-		write_int(&b, i)
-		strings.write_string(&b, ";\n")
-		strings.write_string(&b, "    base")
-		write_int(&b, i)
-		strings.write_string(&b, " =\n      if baseViaInput")
-		write_int(&b, i)
-		strings.write_string(&b, " != null\n      then baseViaInput")
-		write_int(&b, i)
-		strings.write_string(&b, "\n      else (overlayResolved")
-		write_int(&b, i)
-		strings.write_byte(&b, '.')
-		write_attr_path(&b, ap_i)
-		strings.write_string(&b, " or {});\n")
+		strings.write_string(b, "    overlayResolved")
+		write_int(b, i)
+		strings.write_string(b, " = if builtins.isFunction overlaySource")
+		write_int(b, i)
+		strings.write_string(b, " then overlaySource")
+		write_int(b, i)
+		strings.write_string(b, " { system = \"")
+		strings.write_string(b, system_from_attr_path(ap_i))
+		strings.write_string(b, "\"; } else overlaySource")
+		write_int(b, i)
+		strings.write_string(b, ";\n")
+		strings.write_string(b, "    base")
+		write_int(b, i)
+		strings.write_string(b, " =\n      if baseViaInput")
+		write_int(b, i)
+		strings.write_string(b, " != null\n      then baseViaInput")
+		write_int(b, i)
+		strings.write_string(b, "\n      else (overlayResolved")
+		write_int(b, i)
+		strings.write_byte(b, '.')
+		write_attr_path(b, ap_i)
+		strings.write_string(b, " or {});\n")
 	}
 
 	// One splice per configured overlay entry: resolve the base set at the
@@ -198,78 +249,78 @@ generate_overlay_root_flake :: proc(
 	// present. v1 targets the single-entry case; multi-entry
 	// simply repeats the splice set per attrPath.
 	for e in 0 ..< len(cfg.overlays) {
-		strings.write_string(&b, "    childCalls")
-		write_int(&b, e)
-		strings.write_string(&b, " = {\n")
+		strings.write_string(b, "    childCalls")
+		write_int(b, e)
+		strings.write_string(b, " = {\n")
 		for c in emit {
-			strings.write_string(&b, "      ")
-			write_attr_key(&b, c.name)
+			strings.write_string(b, "      ")
+			write_attr_key(b, c.name)
 			// Per-child user override hook: when the workspace has a hidden
 			// .nws/packages/<name>.nix, it is called with callPackage against
 			// the spliced scope (so sibling-named deps resolve locally).
 			// Absence of the file falls through to the bare source build.
 			// Paths are emitted as unquoted Nix path tokens — quoted strings
 			// fail Nix eval; unsafe names are already skipped above.
-			strings.write_string(&b, " = prev:\n        if builtins.pathExists ./.nws/packages/")
-			strings.write_string(&b, c.name)
-			strings.write_string(&b, ".nix\n")
-			strings.write_string(&b, "        then prev.callPackage ./.nws/packages/")
-			strings.write_string(&b, c.name)
-			strings.write_string(&b, ".nix { }\n")
+			strings.write_string(b, " = prev:\n        if builtins.pathExists ./.nws/packages/")
+			strings.write_string(b, c.name)
+			strings.write_string(b, ".nix\n")
+			strings.write_string(b, "        then prev.callPackage ./.nws/packages/")
+			strings.write_string(b, c.name)
+			strings.write_string(b, ".nix { }\n")
 			// When the child name exists in the spliced scope, src-override
 			// it: dependencies are inherited from the overlay rather than re-parsed.
-			strings.write_string(&b, "        else if (prev.")
-			write_attr_key(&b, c.name)
-			strings.write_string(&b, " or null) != null\n")
-			strings.write_string(&b, "        then prev.")
-			write_attr_key(&b, c.name)
-			strings.write_string(&b, ".overrideAttrs (final: { src = ./")
-			strings.write_string(&b, c.rel_path)
-			strings.write_string(&b, "; })\n")
+			strings.write_string(b, "        else if (prev.")
+			write_attr_key(b, c.name)
+			strings.write_string(b, " or null) != null\n")
+			strings.write_string(b, "        then prev.")
+			write_attr_key(b, c.name)
+			strings.write_string(b, ".overrideAttrs (final: { src = ./")
+			strings.write_string(b, c.rel_path)
+			strings.write_string(b, "; })\n")
 			// Raw source checkouts (no default.nix) are built through the
 			// distro scope's buildRosPackage; plain callPackage remains as the
 			// fallback for scopes without it.
-			strings.write_string(&b, "        else if (prev.buildRosPackage or null) != null\n")
-			strings.write_string(&b, "        then prev.buildRosPackage {\n")
-			strings.write_string(&b, "          pname = \"")
-			nix_escape_string(&b, c.name)
-			strings.write_string(&b, "\";\n")
-			strings.write_string(&b, "          version = \"0.0.0\";\n")
-			strings.write_string(&b, "          src = ./")
-			strings.write_string(&b, c.rel_path)
-			strings.write_string(&b, ";\n")
-			strings.write_string(&b, "        }\n")
-			strings.write_string(&b, "        else prev.callPackage ./")
-			strings.write_string(&b, c.rel_path)
-			strings.write_string(&b, " { };\n")
+			strings.write_string(b, "        else if (prev.buildRosPackage or null) != null\n")
+			strings.write_string(b, "        then prev.buildRosPackage {\n")
+			strings.write_string(b, "          pname = \"")
+			nix_escape_string(b, c.name)
+			strings.write_string(b, "\";\n")
+			strings.write_string(b, "          version = \"0.0.0\";\n")
+			strings.write_string(b, "          src = ./")
+			strings.write_string(b, c.rel_path)
+			strings.write_string(b, ";\n")
+			strings.write_string(b, "        }\n")
+			strings.write_string(b, "        else prev.callPackage ./")
+			strings.write_string(b, c.rel_path)
+			strings.write_string(b, " { };\n")
 		}
-		strings.write_string(&b, "    };\n")
+		strings.write_string(b, "    };\n")
 
-		strings.write_string(&b, "    spliced")
-		write_int(&b, e)
-		strings.write_string(&b, " =\n      if (base")
-		write_int(&b, e)
-		strings.write_string(&b, ".overrideScope' or null) != null\n")
-		strings.write_string(&b, "      then base")
-		write_int(&b, e)
+		strings.write_string(b, "    spliced")
+		write_int(b, e)
+		strings.write_string(b, " =\n      if (base")
+		write_int(b, e)
+		strings.write_string(b, ".overrideScope' or null) != null\n")
+		strings.write_string(b, "      then base")
+		write_int(b, e)
 		strings.write_string(
-			&b,
+			b,
 			".overrideScope' (final: prev: builtins.mapAttrs (_: f: f prev) childCalls",
 		)
-		write_int(&b, e)
-		strings.write_string(&b, ")\n")
-		strings.write_string(&b, "      else base")
-		write_int(&b, e)
-		strings.write_string(&b, " // builtins.mapAttrs (_: f: f base")
-		write_int(&b, e)
-		strings.write_string(&b, ") childCalls")
-		write_int(&b, e)
-		strings.write_string(&b, ";\n")
+		write_int(b, e)
+		strings.write_string(b, ")\n")
+		strings.write_string(b, "      else base")
+		write_int(b, e)
+		strings.write_string(b, " // builtins.mapAttrs (_: f: f base")
+		write_int(b, e)
+		strings.write_string(b, ") childCalls")
+		write_int(b, e)
+		strings.write_string(b, ";\n")
 	}
 
 	// The `in` boundary: splice bindings above live in the let, everything
 	// below is the flake's output attrset.
-	strings.write_string(&b, "  in\n  {\n")
+	strings.write_string(b, "  in\n  {\n")
 
 	// One output attribute per configured overlay entry: the spliced set.
 	for e in 0 ..< len(cfg.overlays) {
@@ -277,11 +328,11 @@ generate_overlay_root_flake :: proc(
 		if len(ap) == 0 {
 			ap = "pkgs"
 		}
-		strings.write_string(&b, "    ")
-		write_attr_path(&b, ap)
-		strings.write_string(&b, " = spliced")
-		write_int(&b, e)
-		strings.write_string(&b, ";\n")
+		strings.write_string(b, "    ")
+		write_attr_path(b, ap)
+		strings.write_string(b, " = spliced")
+		write_int(b, e)
+		strings.write_string(b, ";\n")
 	}
 
 	// Convenience direct-build output: packages.<system> exposing every
@@ -292,15 +343,15 @@ generate_overlay_root_flake :: proc(
 	if len(cfg.overlays) > 0 && len(cfg.overlays[0].attr_path) > 0 {
 		first_ap = cfg.overlays[0].attr_path
 	}
-	strings.write_string(&b, "    packages.")
-	strings.write_string(&b, system_from_attr_path(first_ap))
-	strings.write_string(&b, " = {\n")
+	strings.write_string(b, "    packages.")
+	strings.write_string(b, system_from_attr_path(first_ap))
+	strings.write_string(b, " = {\n")
 	for c in emit {
-		strings.write_string(&b, "      ")
-		write_attr_key(&b, c.name)
-		strings.write_string(&b, " = spliced0.")
-		write_attr_key(&b, c.name)
-		strings.write_string(&b, ";\n")
+		strings.write_string(b, "      ")
+		write_attr_key(b, c.name)
+		strings.write_string(b, " = spliced0.")
+		write_attr_key(b, c.name)
+		strings.write_string(b, ";\n")
 	}
 
 	// Bare `nix build` requires packages.<system>.default to be a DERIVATION
@@ -311,27 +362,25 @@ generate_overlay_root_flake :: proc(
 	// nixpkgs.url; when neither exists (all non-flake overlays) fall back to
 	// the first child so the attribute remains a valid derivation.
 	sys := system_from_attr_path(first_ap)
-	strings.write_string(&b, "      default = (if builtins.hasAttr \"nixpkgs\" inputs then\n")
-	strings.write_string(&b, "        (import inputs.nixpkgs { system = \"")
-	strings.write_string(&b, sys)
-	strings.write_string(&b, "\"; }).buildEnv {\n")
-	strings.write_string(&b, "          name = \"nws-workspace-env\";\n")
-	strings.write_string(&b, "          paths = [\n")
+	strings.write_string(b, "      default = (if builtins.hasAttr \"nixpkgs\" inputs then\n")
+	strings.write_string(b, "        (import inputs.nixpkgs { system = \"")
+	strings.write_string(b, sys)
+	strings.write_string(b, "\"; }).buildEnv {\n")
+	strings.write_string(b, "          name = \"nws-workspace-env\";\n")
+	strings.write_string(b, "          paths = [\n")
 	for c in emit {
-		strings.write_string(&b, "            spliced0.")
-		write_attr_key(&b, c.name)
-		strings.write_string(&b, "\n")
+		strings.write_string(b, "            spliced0.")
+		write_attr_key(b, c.name)
+		strings.write_string(b, "\n")
 	}
-	strings.write_string(&b, "          ];\n")
-	strings.write_string(&b, "        }\n")
-	strings.write_string(&b, "      else spliced0.")
-	write_attr_key(&b, emit[0].name)
-	strings.write_string(&b, ");\n")
-	strings.write_string(&b, "    };\n")
+	strings.write_string(b, "          ];\n")
+	strings.write_string(b, "        }\n")
+	strings.write_string(b, "      else spliced0.")
+	write_attr_key(b, emit[0].name)
+	strings.write_string(b, ");\n")
+	strings.write_string(b, "    };\n")
 
-	strings.write_string(&b, "  };\n}\n")
-
-	return strings.clone(strings.to_string(b), allocator)
+	strings.write_string(b, "  };\n")
 }
 
 // write_input_name writes the flake input name for the i-th *flake* overlay

@@ -34,8 +34,8 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
 	got := core.generate_overlay_root_flake(children, cfg)
 	defer delete(got)
 
-	want := `# nws-generated — do not edit
-{
+	want := `{
+# nws block — managed by nws; do not edit
   inputs = {
     overlay0.url = "github:lopsided98/nix-ros-overlay/master";
     nixpkgs.follows = "overlay0/nixpkgs";
@@ -96,6 +96,7 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
       else spliced0.tf2);
     };
   };
+# /nws block
 }
 `
 	testing.expectf(
@@ -108,16 +109,18 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
 
 	testing.expectf(
 		t,
-		core.is_managed_root(got),
-		"generated overlay flake does not pass is_managed_root",
+		core.has_nws_block(got),
+		"generated overlay flake should be detected by its nws block",
 	)
 }
 
-// The block form carries exactly the whole-file body between the markers:
-// BEGIN on its own line, then the identical inner text (inputs + outputs
-// sections), then END on its own line. Every binding name stays put
-// (`spliced0`, `childCalls0`, `base0`, `overlay0`, `nixpkgs`, `inputs`) so
-// user attrs referencing block internals survive regeneration.
+// The block form carries the whole nws body between the markers: BEGIN on
+// its own line, then the identical inner text (inputs + outputs sections),
+// then END on its own line. Every binding name stays put (`spliced0`,
+// `childCalls0`, `base0`, `overlay0`, `nixpkgs`, `inputs`) so user attrs
+// referencing block internals survive regeneration. The whole-file form is
+// the create-path shape `{` + block + `}` — no managed header — and
+// patch_flake("", block) produces the same bytes.
 @(test)
 test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
@@ -145,17 +148,26 @@ test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 		block,
 	)
 
-	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
-	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	// ISC-3: the whole-file form wraps the block in a minimal `{ ... }` shell
+	// (no `# nws-generated` header line).
+	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	defer delete(want_whole)
 	testing.expectf(
 		t,
-		inner == body,
-		"block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
-		inner,
-		body,
+		whole == want_whole,
+		"whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		whole,
+		want_whole,
 	)
 
+	// The daemon's create path must produce exactly the same bytes.
+	created, ok := core.patch_flake("", block)
+	defer delete(created)
+	testing.expectf(t, ok, "create path must succeed")
+	testing.expectf(t, created == whole, "patch_flake(\"\") must equal the create-shape flake")
+
 	// Stable binding names (ISC-7): user attrs reference these across regens.
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
 	bindings := []string{"spliced0", "childCalls0", "base0", "overlay0", "nixpkgs", "inputs"}
 	for name in bindings {
 		testing.expectf(t, strings.contains(inner, name), "binding %q missing from block", name)
@@ -163,7 +175,8 @@ test_overlay_flake_block_golden :: proc(t: ^testing.T) {
 }
 
 // Empty children: the block still carries the minimal body (`outputs = { ...
-// }: {};`) between its markers.
+// }: {};`) between its markers, and the whole-file form still wraps it
+// without any header.
 @(test)
 test_overlay_flake_block_empty_children :: proc(t: ^testing.T) {
 	cfg := ros_cfg()
@@ -174,17 +187,26 @@ test_overlay_flake_block_empty_children :: proc(t: ^testing.T) {
 	whole := core.generate_overlay_root_flake(nil, cfg)
 	defer delete(whole)
 
-	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
-	inner := block[len(block_prefix):len(block) - len(block_suffix)]
-	testing.expectf(
-		t,
-		inner == body,
-		"empty block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
-		inner,
-		body,
-	)
 	testing.expectf(t, strings.has_prefix(block, block_prefix), "BEGIN marker missing")
 	testing.expectf(t, strings.has_suffix(block, block_suffix), "END marker missing")
+
+	// ISC-10: zero children still yields a valid, block-carrying flake whose
+	// body is the minimal `outputs = { ... }: {};`.
+	testing.expectf(
+		t,
+		strings.contains(block, "  outputs = { ... }: {};\n"),
+		"minimal body missing",
+	)
+
+	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	defer delete(want_whole)
+	testing.expectf(
+		t,
+		whole == want_whole,
+		"empty whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		whole,
+		want_whole,
+	)
 }
 
 // Calling twice with equal inputs yields byte-identical output regardless of
@@ -225,9 +247,14 @@ test_overlay_flake_empty_children :: proc(t: ^testing.T) {
 	got := core.generate_overlay_root_flake(nil, cfg)
 	defer delete(got)
 
-	want := "# nws-generated — do not edit\n{\n  outputs = { ... }: {};\n}\n"
+	want := `{
+# nws block — managed by nws; do not edit
+  outputs = { ... }: {};
+# /nws block
+}
+`
 	testing.expectf(t, got == want, "empty-children mismatch:\n%s", got)
-	testing.expect(t, core.is_managed_root(got))
+	testing.expect(t, core.has_nws_block(got))
 }
 
 // Every child splice is guarded by a pathExists check on the user's hidden
@@ -320,8 +347,8 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
 	got := core.generate_overlay_root_flake(children, cfg)
 	defer delete(got)
 
-	want := `# nws-generated — do not edit
-{
+	want := `{
+# nws block — managed by nws; do not edit
   outputs = { ... }@inputs:
   let
     baseViaInput0 = null;
@@ -364,6 +391,7 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
       else spliced0.foo);
     };
   };
+# /nws block
 }
 `
 	testing.expectf(

@@ -20,10 +20,12 @@ Overlay_Child :: struct {
 // outputs, falling back to the imported overlay source) and splices the
 // matched children into that set via `overrideScope'` when it is a fixpoint
 // scope (so shadowing propagates to consumers), or a plain attrset merge
-// otherwise. The whole-file form wraps the nws body (see write_overlay_body
-// and generate_overlay_block) in the managed header and the top-level
-// `{ ... }` scaffold; the body itself is byte-identical to the block form's
-// inner text.
+// otherwise. This is the create-path shape (ISC-3): a plain user flake whose
+// nws block is present — `{` + the block (see generate_overlay_block) + `}`
+// — with no magic whole-file header. The daemon no longer calls it (it
+// patches the block in place), but the shape doubles as the minimal fresh
+// flake nws writes when flake.nix is absent, and user content later added
+// around the block survives regenerations.
 //
 // Like generate_root_flake this is a pure function of its arguments: children
 // are emitted sorted by name (ties broken by rel_path), everything is written
@@ -48,15 +50,14 @@ generate_overlay_root_flake :: proc(
 	cfg: Workspace_Config,
 	allocator := context.allocator,
 ) -> string {
-	emit := overlay_emit_children(matched, allocator)
-	defer delete(emit)
+	block := generate_overlay_block(matched, cfg, allocator)
+	defer delete(block)
 
 	b := strings.builder_make(allocator)
 	defer strings.builder_destroy(&b)
 
-	strings.write_string(&b, MANAGED_ROOT_HEADER)
-	strings.write_string(&b, "\n{\n")
-	write_overlay_body(&b, emit[:], cfg)
+	strings.write_string(&b, "{\n")
+	strings.write_string(&b, block)
 	strings.write_string(&b, "}\n")
 
 	return strings.clone(strings.to_string(b), allocator)
@@ -125,12 +126,13 @@ overlay_emit_children :: proc(
 }
 
 // write_overlay_body writes the nws-owned body of an overlay root flake:
-// everything that lives between the top-level `{` and `}` of the whole-file
-// form — and, byte-identically, between the NWS_BLOCK_BEGIN/NWS_BLOCK_END
-// markers of the block form. Zero safe children yields the minimal valid
-// body `outputs = { ... }: {};`.
+// everything that lives between the NWS_BLOCK_BEGIN/NWS_BLOCK_END markers of
+// the block form (and, wrapped in the top-level `{ ... }`, of the whole-file
+// create shape). Zero safe children yields the minimal valid body
+// `outputs = { ... }: {};`.
 write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Workspace_Config) {
-	// Zero safe children: minimal valid managed flake (still passes is_managed_root).
+	// Zero safe children: minimal valid managed flake (its nws block still
+	// marks the flake as serviced by the daemon).
 	if len(emit) == 0 {
 		strings.write_string(b, "  outputs = { ... }: {};\n")
 		return

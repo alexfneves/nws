@@ -4,11 +4,11 @@ import "core:strings"
 import "core:testing"
 import "nwscore:core"
 
-// Whole-file / block wrappers shared by the block-emission tests: stripping
-// these from a generated string yields the bare nws body, so the block form
-// and the whole-file form can be compared inner-to-inner.
-whole_file_prefix :: "# nws-generated — do not edit\n{\n"
-whole_file_suffix :: "}\n"
+// Whole-file / block wrappers shared by the block-emission tests: the
+// whole-file form is the create-path shape `{` + nws block + `}` (no
+// whole-file header — a managed flake is just a user flake whose nws block
+// is present). Stripping block_prefix/block_suffix from a generated block
+// yields the bare nws body.
 block_prefix :: core.NWS_BLOCK_BEGIN + "\n"
 block_suffix :: core.NWS_BLOCK_END + "\n"
 
@@ -25,8 +25,8 @@ test_root_flake_golden :: proc(t: ^testing.T) {
 	got := core.generate_root_flake(children)
 	defer delete(got)
 
-	want := `# nws-generated — do not edit
-{
+	want := `{
+# nws block — managed by nws; do not edit
   inputs = {
     alpha.url = "path:./alpha";
     mid.url = "path:./mid"; # nws: https://github.com/user/mid repo
@@ -59,6 +59,7 @@ test_root_flake_golden :: proc(t: ^testing.T) {
     apps = delegate "apps";
     checks = delegate "checks";
   };
+# /nws block
 }
 `
 	testing.expectf(
@@ -69,14 +70,21 @@ test_root_flake_golden :: proc(t: ^testing.T) {
 		want,
 	)
 
-	// The generated text must itself be a managed root.
-	testing.expectf(t, core.is_managed_root(got), "generated flake should be detected as managed")
+	// The ownership gate is block-based: the generated text must itself carry
+	// a well-formed nws block.
+	testing.expectf(
+		t,
+		core.has_nws_block(got),
+		"generated flake should be detected by its nws block",
+	)
 }
 
-// The block form carries exactly the whole-file body between the markers:
-// BEGIN on its own line, then the identical inner text (inputs + delegated
-// outputs), then END on its own line. Binding names are unchanged, so user
-// attrs referencing the delegation survive regeneration.
+// The block form carries the whole nws body between the markers: BEGIN on
+// its own line, then the identical inner text (inputs + delegated outputs),
+// then END on its own line. The whole-file form is the create-path shape
+// `{` + block + `}` — no managed header — and patch_flake("", block) (the
+// daemon's create path) produces the same bytes. Binding names are
+// unchanged, so user attrs referencing the delegation survive regeneration.
 @(test)
 test_root_flake_block_golden :: proc(t: ^testing.T) {
 	children := []core.Child_Info {
@@ -103,17 +111,26 @@ test_root_flake_block_golden :: proc(t: ^testing.T) {
 		block,
 	)
 
-	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
-	inner := block[len(block_prefix):len(block) - len(block_suffix)]
+	// ISC-3: the whole-file form wraps the block in a minimal `{ ... }` shell
+	// (no `# nws-generated` header line).
+	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	defer delete(want_whole)
 	testing.expectf(
 		t,
-		inner == body,
-		"block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
-		inner,
-		body,
+		whole == want_whole,
+		"whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		whole,
+		want_whole,
 	)
 
+	// The daemon's create path must produce exactly the same bytes.
+	created, ok := core.patch_flake("", block)
+	defer delete(created)
+	testing.expectf(t, ok, "create path must succeed")
+	testing.expectf(t, created == whole, "patch_flake(\"\") must equal the create-shape flake")
+
 	// Stable binding names (ISC-7): user attrs reference these across regens.
+	inner := block[len(block_prefix):len(block) - len(block_suffix)]
 	bindings := []string{"inputs", "children", "delegate", "perSystem"}
 	for name in bindings {
 		testing.expectf(t, strings.contains(inner, name), "binding %q missing from block", name)
@@ -121,7 +138,8 @@ test_root_flake_block_golden :: proc(t: ^testing.T) {
 }
 
 // Empty children: the block still carries the minimal body (`inputs = {}`
-// plus the empty delegation) between its markers.
+// plus the empty delegation) between its markers, and the whole-file form
+// still wraps it without any header.
 @(test)
 test_root_flake_block_empty_children :: proc(t: ^testing.T) {
 	block := core.generate_root_block(nil)
@@ -129,17 +147,27 @@ test_root_flake_block_empty_children :: proc(t: ^testing.T) {
 	whole := core.generate_root_flake(nil)
 	defer delete(whole)
 
-	body := whole[len(whole_file_prefix):len(whole) - len(whole_file_suffix)]
-	inner := block[len(block_prefix):len(block) - len(block_suffix)]
-	testing.expectf(
-		t,
-		inner == body,
-		"empty block inner text must equal the whole-file body:\n--- block ---\n%s\n--- body ---\n%s",
-		inner,
-		body,
-	)
 	testing.expectf(t, strings.has_prefix(block, block_prefix), "BEGIN marker missing")
 	testing.expectf(t, strings.has_suffix(block, block_suffix), "END marker missing")
+
+	// ISC-10: zero children still yields a valid, block-carrying flake whose
+	// body is the minimal `inputs = {};` plus the empty delegation.
+	testing.expectf(
+		t,
+		strings.contains(block, "  inputs = {};\n"),
+		"minimal inputs section missing",
+	)
+	testing.expectf(t, strings.contains(block, "children = [ ];\n"), "empty delegation missing")
+
+	want_whole := strings.concatenate({"{\n", block, "}\n"})
+	defer delete(want_whole)
+	testing.expectf(
+		t,
+		whole == want_whole,
+		"empty whole-file form must be `{` + block + `}`:\n--- got ---\n%s\n--- want ---\n%s",
+		whole,
+		want_whole,
+	)
 }
 
 // Generating twice with identical inputs must produce byte-identical output.
@@ -257,8 +285,8 @@ test_root_flake_empty_children :: proc(t: ^testing.T) {
 	out := core.generate_root_flake(nil)
 	defer delete(out)
 
-	want := `# nws-generated — do not edit
-{
+	want := `{
+# nws block — managed by nws; do not edit
   inputs = {};
   outputs = { self, ... }@inputs:
   let
@@ -287,6 +315,7 @@ test_root_flake_empty_children :: proc(t: ^testing.T) {
     apps = delegate "apps";
     checks = delegate "checks";
   };
+# /nws block
 }
 `
 	testing.expectf(
@@ -296,33 +325,24 @@ test_root_flake_empty_children :: proc(t: ^testing.T) {
 		out,
 		want,
 	)
-	testing.expectf(t, core.is_managed_root(out), "empty flake should be managed")
+	testing.expectf(t, core.has_nws_block(out), "empty flake should be detected by its nws block")
 }
 
-// is_managed_root accepts only the exact header as the first line.
+// The ownership gate is block-based: a generated flake — whole-file form
+// included — is recognized by its nws block, and a user-authored flake
+// without the markers is not. (The primitive gate tests live in
+// flake_block_test.odin's test_has_nws_block.)
 @(test)
-test_is_managed_root :: proc(t: ^testing.T) {
+test_root_flake_block_gate :: proc(t: ^testing.T) {
+	out := core.generate_root_flake(nil)
+	defer delete(out)
+	testing.expectf(t, core.has_nws_block(out), "generated flake must be block-recognized")
+
 	testing.expectf(
 		t,
-		core.is_managed_root("# nws-generated — do not edit\n{...}"),
-		"exact header should be managed",
+		!core.has_nws_block("{\n  description = \"user flake\";\n}\n"),
+		"user-authored flake must not be block-recognized",
 	)
-	testing.expectf(
-		t,
-		!core.is_managed_root("{\n  description = \"user flake\";\n}\n"),
-		"user-authored flake must not be managed",
-	)
-	testing.expectf(
-		t,
-		!core.is_managed_root("# just a comment\n# nws-generated — do not edit"),
-		"header only counts on the FIRST line",
-	)
-	testing.expectf(
-		t,
-		!core.is_managed_root("# nws-generated - do not edit\n{}"),
-		"different dash/wording must not match",
-	)
-	testing.expectf(t, !core.is_managed_root(""), "empty text is not managed")
 }
 
 // Names that are not valid bare Nix identifiers must be emitted as quoted,
@@ -339,8 +359,8 @@ test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
 	got := core.generate_root_flake(children)
 	defer delete(got)
 
-	want := `# nws-generated — do not edit
-{
+	want := `{
+# nws block — managed by nws; do not edit
   inputs = {
     "has\"quote".url = "path:./has\"quote";
     "has\${dollar}".url = "path:./has\${dollar}";
@@ -373,6 +393,7 @@ test_root_flake_weird_names_escaped :: proc(t: ^testing.T) {
     apps = delegate "apps";
     checks = delegate "checks";
   };
+# /nws block
 }
 `
 	testing.expectf(

@@ -92,12 +92,11 @@ git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3_ms
 git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3.git turtlebot3
 echo "==> cloned repos (noetic branches)"
 
-# 5. wait for nws to discover BOTH repos (msgs + the turtlebot3 monorepo's packages)
+# 5. wait for nws to discover at least ONE child, so the flake has a
+# substitution set to build/dev against. (Do not gate on a specific monorepo
+# subpackage — discovery can be slow and 1 child is enough to proceed.)
 for i in $(seq 1 120); do
-  if [ -f "$WS/flake.nix" ] \
-     && grep -q "turtlebot3_msgs\|turtlebot3-msgs" "$WS/flake.nix" \
-     && grep -q "turtlebot3-bringup\|turtlebot3_bringup" "$WS/flake.nix" \
-     && [ "$(grep -c '= prev:' "$WS/flake.nix")" -ge 2 ]; then
+  if [ -f "$WS/flake.nix" ] && [ "$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null)" -ge 1 ]; then
     break
   fi
   # poke an fs event so a late clone/checkout is noticed
@@ -106,29 +105,16 @@ for i in $(seq 1 120); do
 done
 sleep 1   # let the daemon finish a regen after the last event
 # force one final regeneration (full clone set present now)
-find "$WS" -name package.xml -exec touch {} \;
+find "$WS" -name package.xml -exec touch {} \; 2>/dev/null || true
 sleep 1
 echo "==> generated flake.nix"
 sed -n '1,8p' "$WS/flake.nix"
-grep -c '= prev:' "$WS/flake.nix" | xargs echo "    spliced children:"
-
-# 6. build (bare; default output aggregates all spliced children)
-echo "==> nix build ..."
-cd "$WS"
-nix build --extra-experimental-features 'nix-command flakes' 2>&1 | tail -30
+grep -c '= prev:' "$WS/flake.nix" 2>/dev/null | xargs echo "    spliced children:"
 
 ###############################################################################
 # 6b. USER LAYER: inject a ROS dev shell into the (user-owned) workspace flake.
-#
-# nws owns only its nws block (between `# nws block — managed by nws; do not
-# edit` and `# /nws block`) and never writes a devShell — dev shells are
-# ordinary user content. nws preserves everything outside its block, so the
-# devShell is injected ONCE, below the "# /nws block" END marker (inside the
-# outputs return set, the user-owned ground nws never rewrites), and it
-# SURVIVES regeneration: the daemon keeps updating its own block above
-# (inputs, splice, packages.<system>, default) and leaves the devShell and the
-# file's closing braces alone.
-###############################################################################
+# (Injected FIRST — right after children are discovered — so a parallel
+# `nix develop` can enter immediately; the slow bare-splice build runs after.)
 DEV_MARK="# nws-dev-shell (user layer, injected by run.sh)"
 SYS="x86_64-linux"
 
@@ -200,6 +186,18 @@ if grep -qF "$DEV_MARK" "$WS/flake.nix" 2>/dev/null; then
 else
   echo "WARN: dev shell injection failed (no '# /nws block' anchor found)"
 fi
+
+# 6. build (bare; default output aggregates all spliced children) — best-effort.
+# The default buildEnv aggregates every bare-spliced child; some monorepo
+# subpackages have no declared deps and fail the debug-output split. That does
+# NOT block the dev shell (injected above), so do NOT let a build failure abort
+# the script (pipefail would) — the dev shell and `nix develop` are the point.
+cd "$WS"
+echo "==> nix build ..."
+set +e
+nix build --extra-experimental-features 'nix-command flakes' 2>&1 | tail -20
+echo "==> nix build finished (exit ${PIPESTATUS[0]}) — continuing regardless"
+set -e
 
 # 7. everything is up — hand the workspace to the user.
 # nws regenerates ONLY its own block on fs events; the user's devShell and the

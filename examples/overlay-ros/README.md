@@ -22,20 +22,28 @@ the whole run). From the repo root it:
 2. creates a temporary workspace `$WS`,
 3. registers it as an **overlay** workspace pointing at this folder's
    `resolver.sh`,
-4. clones the TurtleBot `turtlebot3_msgs` and `turtlebot3` repos (**noetic**
-   branches — ROS1 versions matching the overlay pin) into the workspace,
+4. clones **exactly two** TurtleBot repos (**noetic** branches, matching the
+   overlay pin):
+   - `turtlebot3_simulations` — the **main roslaunch** package (provides
+     `turtlebot3_gazebo` / `turtlebot3_empty_world.launch` that starts gazebo),
+   - `turtlebot3` — the **modifiable underneath** package (provides
+     `turtlebot3_description`, the URDF/xacro shown in the simulation).
+   Every other dependency is pulled in automatically: the nix build downloads
+   and builds gazebo, gazebo_ros, xacro, robot_state_publisher, all the
+   message/service packages, etc.
 5. waits for nws to discover the packages and generate `flake.nix`,
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child),
 7. **injects a ROS dev shell** (`devShells.<system>.default`) into the
    workspace flake — the USER LAYER — so `cd $WS && nix develop` gives
-   `roscore`, `roslaunch`, `rosrun` with `ROS_MASTER_URI` set and
-   `ROS_PACKAGE_PATH` pointing at: (a) the ROS base env's `share/ros` and
-   (b) every local clone's source dir. That way `rosrun`/`roslaunch` find
-   your **locally cloned** packages directly from source — no need to bake
-   them as built derivations. The devShell is written **below the
-   `# /nws block` END marker**, inside the outputs return set, so it is
-   ordinary user content and survives every nws regeneration,
+   `roscore`, `roslaunch`, `rosrun`, `gazebo`, `rviz` with `ROS_MASTER_URI`
+   set and `ROS_PACKAGE_PATH` covering: (a) a `buildEnv` of the spliced set's
+   `ros-base` + `gazebo` + `gazebo-ros` + `xacro` + `robot-state-publisher` +
+   `turtlebot3-gazebo` + `turtlebot3-description` + `turtlebot3` (so all
+   `$(find ...)` used by the launch resolve), and (b) every local clone's
+   source dir. The devShell is written **below the `# /nws block` END
+   marker**, inside the outputs return set, so it is ordinary user content
+   and survives every nws regeneration,
 8. **holds** — the workspace and daemon stay up and the script prints
    `cd $WS && nix develop`; press **Ctrl+C** to stop the daemon, unregister the
    workspace and delete the folder (the `clean` trap does it).
@@ -66,6 +74,52 @@ daemon keeps watching the workspace and the folder stays on disk. Press
 - Because the local source must match the overlay's pinned deps, the repos are
   cloned from their **ROS1 `noetic` branches**. Cloning `master` would pull ROS2
   source that doesn't match the ROS1/noetic overlay and fails to build.
+
+## Running the gazebo simulation
+
+After `run.sh` holds (workspace ready), run in three terminals (the hold keeps
+the daemon but you don't need it for the sim):
+
+```bash
+# terminal A — the ROS master
+export TURTLEBOT3_MODEL=burger        # or waffle / waffle_pi
+cd <ws> && nix develop
+roscore
+
+# terminal B — start gazebo with the virtual turtlebot
+export TURTLEBOT3_MODEL=burger
+cd <ws> && nix develop
+roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch
+
+# terminal C — drive it (needs one extra clone, see below)
+roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch
+```
+
+You now have a gazebo window with a virtual TurtleBot (URDF from
+`turtlebot3-description`) whose odometry/TF update as you teleop.
+
+### Proving nws is doing the work
+
+Your **local** `turtlebot3/turtlebot3_description` is the one gazebo uses, not
+the upstream overlay package. Edit e.g. `urdf/turtlebot3_burger.urdf.xacro`
+(change a `<material>` colour), save, then relaunch terminal B — the change
+shows in the running gazebo, proving the local splice is live.
+
+### Known upstream quirk (turtlebot3 package bug)
+
+`turtlebot3_gazebo`'s launch uses `$(find xacro)`, `$(find gazebo_ros)` and
+`$(find robot_state_publisher)`, but its `package.xml` **only declares**
+`gazebo, gazebo_ros, geometry_msgs, nav_msgs, roscpp, sensor_msgs, std_msgs,
+tf, turtlebot3_description` — i.e. **`xacro` (and `robot_state_publisher`) are
+undeclared launch-time dependencies**. This is an upstream
+`turtlebot3_simulations` bug, not an nws issue. The example's dev shell pulls
+`xacro`/`robot-state-publisher` in anyway (they're normal overlay packages), so
+the launch works; a bare `ros-base` dev shell would hit
+`RLException: ... package 'xacro' not found`.
+
+> Teleop: `turtlebot3_teleop` (with `turtlebot3_teleop_key.launch`) is a
+> subpackage of the already-cloned `turtlebot3` repo — the resolver discovers it
+> recursively, so it's spliced too, within the two-clone limit.
 
 ## The dev shell is a user layer (nws stays generic)
 

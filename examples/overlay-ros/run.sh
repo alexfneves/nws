@@ -85,10 +85,18 @@ mkdir -p "$WS"
 echo "==> registered $WS"
 
 # 4. clone repos.
-# Use the ROS1 `noetic` branches (nix-ros-overlay ros1-25.05 pins ROS1/noetic
-# versions; cloning `master` would pull ROS2 source that src-overrides don't match).
+# Exactly TWO clones:
+#   - turtlebot3_simulations: the MAIN roslaunch package — provides
+#     turtlebot3_gazebo with turtlebot3_empty_world.launch (starts gazebo).
+#   - turtlebot3: the modifiable UNDERNEATH package — provides
+#     turtlebot3_description (the URDF/xacro). Edit its materials/geometry and
+#     the change is visible in the running gazebo simulation.
+# Everything else (gazebo, gazebo_ros, xacro, robot_state_publisher, all msg/
+# srv deps, the turtlebot3_msgs used by the model, ...) is pulled in
+# automatically: the nix build downloads/builds those dependencies. Use the
+# ROS1 `noetic` branches (ros1-25.05 pins ROS1/noetic; `master` is ROS2).
 cd "$WS"
-git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3_msgs.git turtlebot3-msgs
+git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git turtlebot3-simulations
 git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3.git turtlebot3
 echo "==> cloned repos (noetic branches)"
 
@@ -144,7 +152,16 @@ EOSRC
       pkgsN = import inputs.nixpkgs { system = "$sys"; };
       env = spliced0.buildEnv {
         name = "nws-dev-env";
-        paths = [ spliced0.ros-base ];
+        paths = [
+          spliced0.ros-base
+          spliced0.gazebo
+          spliced0.gazebo-ros
+          spliced0.xacro
+          spliced0.robot-state-publisher
+          spliced0.turtlebot3-gazebo
+          spliced0.turtlebot3-description
+          spliced0.turtlebot3
+        ];
       };
     in pkgsN.mkShell {
       buildInputs = [ env ];
@@ -209,10 +226,26 @@ echo
 echo "==> SUCCESS"
 echo "==> Workspace ready at:    $WS"
 echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
-echo "==> Try it:  cd $WS  &&  nix develop"
-echo "==> The devShell lives below the '# /nws block' marker as ordinary user"
-echo "    content. nws updates only its own block above it, so the devShell"
-echo "    survives; add more outputs below the marker (or devenv) freely."
+echo
+echo "==> Run the GAZEBO simulation (see README):"
+echo "    # terminal 1 (this hold keeps the daemon; run these in OTHER terminals)"
+echo "    export TURTLEBOT3_MODEL=burger   # or waffle / waffle_pi"
+echo "    cd $WS && nix develop                  # into the ROS dev shell"
+echo "    roscore                                 # terminal A: master"
+echo "    roslaunch turtlebot3_gazebo turtlebot3_empty_world.launch"
+echo "        # terminals B: gazebo starts with the virtual turtlebot"
+echo "    roslaunch turtlebot3_teleop turtlebot3_teleop_key.launch"
+echo "        # terminal C: drive it (arrow keys)"
+echo
+echo "==> The two local clones are: turtlebot3 (URDF/description) +"
+echo "    turtlebot3_simulations (main gazebo launch). Edit e.g."
+echo "    $WS/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger.urdf.xacro"
+echo "    (change a <material> colour) and rerun the launch — the change is"
+echo "    visible in the running simulation, proving your spliced package is"
+echo "    the one gazebo uses."
+echo "==> All other deps (gazebo, gazebo_ros, xacro, robot_state_publisher,"
+echo "    msgs, ...) are installed automatically by the nix build."
+echo
 echo "==> Press Ctrl+C to stop the daemon and delete the workspace."
 while true; do
   sleep 3600

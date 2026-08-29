@@ -49,9 +49,10 @@ Overlay_Child :: struct {
 generate_overlay_root_flake :: proc(
 	matched: []Overlay_Child,
 	cfg: Workspace_Config,
+	emit_devshell := false,
 	allocator := context.allocator,
 ) -> string {
-	block := generate_overlay_block(matched, cfg, allocator)
+	block := generate_overlay_block(matched, cfg, emit_devshell, allocator)
 	defer delete(block)
 
 	b := strings.builder_make(allocator)
@@ -79,6 +80,7 @@ generate_overlay_root_flake :: proc(
 generate_overlay_block :: proc(
 	matched: []Overlay_Child,
 	cfg: Workspace_Config,
+	emit_devshell := false,
 	allocator := context.allocator,
 ) -> string {
 	emit := overlay_emit_children(matched, allocator)
@@ -89,7 +91,7 @@ generate_overlay_block :: proc(
 
 	strings.write_string(&b, NWS_BLOCK_BEGIN)
 	strings.write_string(&b, "\n")
-	write_overlay_body(&b, emit[:], cfg)
+	write_overlay_body(&b, emit[:], cfg, emit_devshell)
 	strings.write_string(&b, NWS_BLOCK_END)
 	strings.write_string(&b, "\n")
 
@@ -135,7 +137,12 @@ overlay_emit_children :: proc(
 // create shape). The outputs return set is LEFT OPEN: the last line emitted
 // is the final generated output attr, and the block's END marker follows
 // inside the set. Zero safe children yields the minimal valid body.
-write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Workspace_Config) {
+write_overlay_body :: proc(
+	b: ^strings.Builder,
+	emit: []Overlay_Child,
+	cfg: Workspace_Config,
+	emit_devshell: bool,
+) {
 	// Zero safe children: minimal valid managed flake (its nws block still
 	// marks the flake as serviced by the daemon) — an empty outputs return
 	// set, left open for the END marker; the surrounding file closes it with
@@ -389,6 +396,111 @@ write_overlay_body :: proc(b: ^strings.Builder, emit: []Overlay_Child, cfg: Work
 	write_attr_key(b, emit[0].name)
 	strings.write_string(b, ");\n")
 	strings.write_string(b, "    };\n")
+
+	// Managed devShell (standard nix-ros-overlay pattern, see
+	// write_devshell_attr): emitted when the workspace configures
+	// dev_shell_packages AND a nixpkgs input exists for pkgsN (follows
+	// cascade or explicit nixpkgs.url). All-non-flake overlays without a
+	// nixpkgs input skip it fail-open; the sync also suppresses emission
+	// when the user already owns a devShell (user content wins) unless they
+	// opted into the nested devShell block markers.
+	if emit_devshell && (len(cfg.nixpkgs_url) > 0 || has_flake_overlay(cfg)) {
+		write_devshell_attr(b, emit, cfg, sys)
+	}
+}
+
+// has_flake_overlay reports whether cfg has at least one flake overlay entry
+// (those bring inputs.nixpkgs via the follows cascade).
+has_flake_overlay :: proc(cfg: Workspace_Config) -> bool {
+	for ov in cfg.overlays {
+		if ov.is_flake {
+			return true
+		}
+	}
+	return false
+}
+
+// write_devshell_attr emits a devShells.<system>.default output following the
+// standard nix-ros-overlay devShell shape: mkShell whose `packages` holds a
+// single spliced0.buildEnv env. No shellHook, no env-var manipulation — the
+// packages' own setup hooks wire ROS_PACKAGE_PATH/GAZEBO_PLUGIN_PATH etc.
+write_devshell_attr :: proc(
+	b: ^strings.Builder,
+	emit: []Overlay_Child,
+	cfg: Workspace_Config,
+	sys: string,
+) {
+	strings.write_string(b, "    devShells.")
+	strings.write_string(b, sys)
+	strings.write_string(b, ".default = let\n")
+	strings.write_string(b, "      pkgsN = import inputs.nixpkgs { system = \"")
+	strings.write_string(b, sys)
+	strings.write_string(b, "\"; };\n")
+	write_devshell_env_binding(b, emit, cfg, "      ")
+	strings.write_string(b, "    in pkgsN.mkShell {\n")
+	strings.write_string(b, "      name = \"nws-dev-shell\";\n")
+	strings.write_string(b, "      packages = [ env ];\n")
+	strings.write_string(b, "    };\n")
+}
+
+// build_devshell_fragment renders the nested managed devShell block (its
+// BEGIN and END marker lines around the env binding) for injection INSIDE a
+// user's own devShell `let` (PATCH mode): the user writes
+// `packages = [ env ];` in their own mkShell and nws manages only the marked
+// region. Owned by the caller; delete it when done.
+build_devshell_fragment :: proc(
+	emit: []Overlay_Child,
+	cfg: Workspace_Config,
+	allocator := context.allocator,
+) -> string {
+	b := strings.builder_make(allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, NWS_DEVSHELL_BLOCK_BEGIN)
+	strings.write_string(&b, "\n")
+	write_devshell_env_binding(&b, emit, cfg, "  ")
+	strings.write_string(&b, NWS_DEVSHELL_BLOCK_END)
+	strings.write_string(&b, "\n")
+	return strings.clone(strings.to_string(b), allocator)
+}
+
+// write_devshell_env_binding writes the `env = spliced0.buildEnv {...}`
+// binding shared by both devShell shapes (full attr AND nested block).
+// Children are listed FIRST: buildEnv collision resolution keeps the
+// first-listed path, so the src-override (clone) builds must precede any
+// original overlay build that sibling children propagate into the env —
+// otherwise the upstream files win the merge and the local clones are
+// shadowed. `ignoreCollisions = true` tolerates those same-package pairs
+// (clone build + propagated original of the same package in one env).
+write_devshell_env_binding :: proc(
+	b: ^strings.Builder,
+	emit: []Overlay_Child,
+	cfg: Workspace_Config,
+	indent: string,
+) {
+	strings.write_string(b, indent)
+	strings.write_string(b, "env = spliced0.buildEnv {\n")
+	strings.write_string(b, indent)
+	strings.write_string(b, "  name = \"nws-dev-env\";\n")
+	strings.write_string(b, indent)
+	strings.write_string(b, "  ignoreCollisions = true;\n")
+	strings.write_string(b, indent)
+	strings.write_string(b, "  paths = [\n")
+	for c in emit {
+		strings.write_string(b, indent)
+		strings.write_string(b, "    spliced0.")
+		write_attr_key(b, c.name)
+		strings.write_string(b, "\n")
+	}
+	for p in cfg.dev_shell_packages {
+		strings.write_string(b, indent)
+		strings.write_string(b, "    spliced0.")
+		write_attr_key(b, p)
+		strings.write_string(b, "\n")
+	}
+	strings.write_string(b, indent)
+	strings.write_string(b, "  ];\n")
+	strings.write_string(b, indent)
+	strings.write_string(b, "};\n")
 }
 
 // write_input_name writes the flake input name for the i-th *flake* overlay

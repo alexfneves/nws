@@ -1,5 +1,6 @@
 package tests
 
+import "core:strings"
 import "core:testing"
 import "nwscore:core"
 
@@ -152,4 +153,77 @@ test_register_wire_register_parse_unknown_params_ignored_fail_open :: proc(t: ^t
 	defer core.register_free(&parsed)
 	testing.expect_value(t, ok, true)
 	testing.expectf(t, len(parsed.overlays) == 1, "entries %d", len(parsed.overlays))
+}
+
+// devShellPackages query param survives the REGISTER encode/parse round-trip
+// (comma-joined, percent-encoded, split back into per-attr strings).
+@(test)
+test_register_wire_round_trip_dev_shell_packages :: proc(t: ^testing.T) {
+	req := core.Register_Request {
+		path       = "/tmp/overlay ws",
+		is_overlay = true,
+	}
+	append(
+		&req.overlays,
+		core.Overlay_Entry {
+			url = "github:lopsided98/nix-ros-overlay/ros1-25.05",
+			attr_path = "legacyPackages.x86_64-linux.noetic",
+			is_flake = true,
+		},
+	)
+	pkgs := []string{"ros-base", "gazebo-ros-pkgs", "xacro"}
+	for p in pkgs {
+		append(&req.dev_shell_packages, strings.clone(p))
+	}
+	defer {
+		delete(req.overlays)
+		for p in req.dev_shell_packages {
+			delete(p)
+		}
+		delete(req.dev_shell_packages)
+	}
+	enc := core.register_encode(&req)
+	defer delete(enc)
+
+	parsed, ok := core.register_parse(enc)
+	defer core.register_free(&parsed)
+	testing.expect_value(t, ok, true)
+	testing.expect(t, parsed.path == req.path, "path %q", parsed.path)
+	testing.expect_value(t, len(parsed.dev_shell_packages), 3)
+	testing.expect(
+		t,
+		parsed.dev_shell_packages[0] == "ros-base",
+		"got %q",
+		parsed.dev_shell_packages[0],
+	)
+	testing.expect(
+		t,
+		parsed.dev_shell_packages[2] == "xacro",
+		"got %q",
+		parsed.dev_shell_packages[2],
+	)
+}
+
+// Missing devShellPackages → empty list, still a valid overlay request.
+@(test)
+test_register_wire_no_dev_shell_packages_is_empty :: proc(t: ^testing.T) {
+	req := core.Register_Request {
+		path       = "/tmp/plain",
+		is_overlay = true,
+	}
+	append(
+		&req.overlays,
+		core.Overlay_Entry {
+			url = "github:lopsided98/nix-ros-overlay/ros1-25.05",
+			attr_path = "noetic",
+			is_flake = true,
+		},
+	)
+	defer delete(req.overlays)
+	enc := core.register_encode(&req)
+	defer delete(enc)
+	parsed, ok := core.register_parse(enc)
+	defer core.register_free(&parsed)
+	testing.expect_value(t, ok, true)
+	testing.expect(t, len(parsed.dev_shell_packages) == 0, "expected empty list")
 }

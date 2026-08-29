@@ -20,6 +20,19 @@ NWS_BLOCK_BEGIN :: "# nws block — managed by nws; do not edit"
 // NWS_BLOCK_END marks the end of the nws-owned region.
 NWS_BLOCK_END :: "# /nws block"
 
+// NWS_DEVSHELL_BLOCK_BEGIN/END mark a nested managed region INSIDE a user's
+// own devShell definition (typically inside its `let`). When a workspace
+// enables the managed devShell (dev_shell_packages non-empty) and these
+// markers are present, nws fills the span with the `env = spliced0.buildEnv
+// {...}` binding (children first, then the configured extras) so the user's
+// devShell just writes `packages = [ env ];` — the standard nix-ros-overlay
+// shape. The main nws block must NOT also emit devShells.<system>.default in
+// this case (duplicate attr); presence of the markers suppresses emission.
+NWS_DEVSHELL_BLOCK_BEGIN :: "# nws devShell block — managed by nws; do not edit"
+
+// NWS_DEVSHELL_BLOCK_END marks the end of the nested devShell region.
+NWS_DEVSHELL_BLOCK_END :: "# /nws devShell block"
+
 // find_nws_block locates the first well-formed nws block in text: the first
 // line whose trimmed content equals NWS_BLOCK_BEGIN, then the next line whose
 // trimmed content equals NWS_BLOCK_END. The returned byte span [start, end)
@@ -72,6 +85,116 @@ find_nws_block :: proc(text: string) -> (start, end: int, ok: bool) {
 has_nws_block :: proc(text: string) -> bool {
 	_, _, ok := find_nws_block(text)
 	return ok
+}
+
+// find_devshell_block locates the first well-formed nested devShell block in
+// text: the first line whose trimmed content equals NWS_DEVSHELL_BLOCK_BEGIN,
+// then the next line whose trimmed content equals NWS_DEVSHELL_BLOCK_END. The
+// returned byte span [start, end) covers the BEGIN line through the END line
+// inclusive, each including its trailing newline when present. ok is false —
+// and start/end are both -1 — for missing or malformed/duplicated markers
+// (fail-open, never corrupt).
+find_devshell_block :: proc(text: string) -> (start, end: int, ok: bool) {
+	start, end = -1, -1
+	begin_off := -1
+	n := len(text)
+	i := 0
+	for i <= n {
+		j := i
+		for j < n && text[j] != '\n' {
+			j += 1
+		}
+		t := strings.trim_space(text[i:j])
+		if begin_off == -1 {
+			if t == NWS_DEVSHELL_BLOCK_BEGIN {
+				begin_off = i
+			}
+		} else {
+			if t == NWS_DEVSHELL_BLOCK_BEGIN {
+				return // duplicated BEGIN — ambiguous, fail open
+			}
+			if t == NWS_DEVSHELL_BLOCK_END {
+				end = j
+				if j < n && text[j] == '\n' {
+					end = j + 1
+				}
+				return begin_off, end, true
+			}
+		}
+		if j >= n {
+			break
+		}
+		i = j + 1
+	}
+	return
+}
+
+// patch_devshell_block replaces the marked devShell region (BEGIN line through
+// END line inclusive) of existing with block — where block is expected to
+// carry its own BEGIN and END marker lines around the generated binding. When
+// no well-formed region exists, existing is returned unchanged (fail-open).
+patch_devshell_block :: proc(existing, block: string) -> (string, bool) {
+	start, end, ok := find_devshell_block(existing)
+	if !ok {
+		return existing, false
+	}
+	b := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, existing[:start])
+	strings.write_string(&b, block)
+	strings.write_string(&b, existing[end:])
+	return strings.clone(strings.to_string(b), context.allocator), true
+}
+
+// user_zone_has_devshell reports whether text declares a devShell ANYWHERE
+// outside the nws-managed block span (any system attr — the nws block itself
+// may legitimately contain `devShells.<system>.default` when nws emits it).
+// The check is literal-aware (scan_tokens): only the identifier `devShells`
+// as a code token counts, so prose/strings mentioning it cannot trip the
+// guard. When the user already owns a devShell, nws must NOT emit its own
+// top-level devShell (duplicate-attribute eval errors); it either fills the
+// user's nested devShell block (when the markers are present) or leaves the
+// user's content alone (fail-open).
+user_zone_has_devshell :: proc(text: string) -> bool {
+	nw_start, nw_end, has_block := find_nws_block(text)
+	if has_block && user_zone_has_devshell_span(text, 0, nw_start) {
+		return true
+	}
+	if has_block && user_zone_has_devshell_span(text, nw_end, len(text)) {
+		return true
+	}
+	if !has_block {
+		return user_zone_has_devshell_span(text, 0, len(text))
+	}
+	return false
+}
+
+// user_zone_has_devshell_span scans [start, end) of text for the code-token
+// identifier `devShells` (word-bounded).
+user_zone_has_devshell_span :: proc(text: string, start, end: int) -> bool {
+	tokens := scan_tokens(text, context.allocator)
+	defer delete(tokens)
+	for tok in tokens {
+		if tok.kind != .Code {
+			continue
+		}
+		if tok.start >= end || tok.end <= start {
+			continue
+		}
+		a := max(tok.start, start)
+		z := min(tok.end, end)
+		for i := a; i < z; i += 1 {
+			if strings.has_prefix(text[i:z], "devShells") {
+				before_ok := i == a || !ident_cont_byte(text[i - 1])
+				after := i + len("devShells")
+				after_ok := after >= z || !ident_cont_byte(text[after])
+				if before_ok && after_ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // patch_flake applies a complete block (its own BEGIN marker line, body, and

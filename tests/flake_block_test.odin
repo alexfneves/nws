@@ -501,3 +501,119 @@ test_patch_flake_malformed_block_injects :: proc(t: ^testing.T) {
 		"user's dangling BEGIN must survive alongside the fresh block",
 	)
 }
+
+// The nested devShell block markers are filled by patch_devshell_block with
+// the generated env binding (markers rewritten wholesale, bytes outside the
+// span untouched).
+@(test)
+test_devshell_block_patch_fills_region :: proc(t: ^testing.T) {
+	existing := strings.concatenate(
+		{
+			"    devShells.x86_64-linux.default = let\n",
+			"      pkgsN = import inputs.nixpkgs { system = \"x86_64-linux\"; };\n",
+			"      # nws devShell block — managed by nws; do not edit\n",
+			"      # /nws devShell block\n",
+			"    in pkgsN.mkShell {\n",
+			"      packages = [ env ];\n",
+			"    };\n",
+		},
+	)
+	defer delete(existing)
+	fragment := strings.concatenate(
+		{
+			"# nws devShell block — managed by nws; do not edit\n",
+			"  env = spliced0.buildEnv {\n",
+			"    ignoreCollisions = true;\n",
+			"    paths = [ spliced0.tf2 ];\n",
+			"  };\n",
+			"# /nws devShell block\n",
+		},
+	)
+	defer delete(fragment)
+	got, ok := core.patch_devshell_block(existing, fragment)
+	defer delete(got)
+	testing.expect_value(t, ok, true)
+	testing.expect(t, strings.contains(got, "env = spliced0.buildEnv {"), "env missing")
+	testing.expect(t, strings.contains(got, "ignoreCollisions = true;"), "collisions missing")
+	testing.expect(t, strings.contains(got, "paths = [ spliced0.tf2 ];"), "paths missing")
+	testing.expect(t, strings.contains(got, "packages = [ env ];"), "user content clobbered")
+	testing.expect(t, strings.contains(got, "pkgsN.mkShell"), "user content clobbered")
+}
+
+// No (or malformed) markers → fail-open: text returned unchanged, ok=false.
+@(test)
+test_devshell_block_patch_no_markers_fail_open :: proc(t: ^testing.T) {
+	existing := "let x = 1; in x"
+	got, ok := core.patch_devshell_block(
+		existing,
+		"# nws devShell block — managed by nws; do not edit\nenv = 1;\n# /nws devShell block\n",
+	)
+	defer if ok {
+		delete(got)
+	}
+	testing.expect_value(t, ok, false)
+	testing.expect(t, got == existing, "text must be unchanged on fail-open")
+}
+
+// user_zone_has_devshell: a user-zone (outside the nws block) `devShells.`
+// attr is detected; one INSIDE the nws block (nws-emitted) is not; `devShells`
+// in a comment/string is not.
+@(test)
+test_user_zone_has_devshell_detection :: proc(t: ^testing.T) {
+	// nws block with an emitted devShells attr (nws-owned) + user zone without
+	// any devShell → false.
+	block_only := strings.concatenate(
+		{
+			"{\n",
+			"# nws block — managed by nws; do not edit\n",
+			"  outputs = { ... }@inputs:\n",
+			"  {\n",
+			"    devShells.x86_64-linux.default = pkgsN.mkShell { packages = [ env ]; };\n",
+			"# /nws block\n",
+			"  };\n",
+			"}\n",
+		},
+	)
+	defer delete(block_only)
+	testing.expect_value(t, core.user_zone_has_devshell(block_only), false)
+
+	// User zone (below the END marker) declares its own devShell → true.
+	user_zone := strings.concatenate(
+		{
+			"{\n",
+			"# nws block — managed by nws; do not edit\n",
+			"  outputs = { ... }@inputs:\n",
+			"  {\n",
+			"# /nws block\n",
+			"    devShells.x86_64-linux.default = pkgsN.mkShell { };\n",
+			"  };\n",
+			"}\n",
+		},
+	)
+	defer delete(user_zone)
+	testing.expect_value(t, core.user_zone_has_devshell(user_zone), true)
+
+	// `devShells` only mentioned in a comment / string → false.
+	comment_zone := strings.concatenate(
+		{
+			"{\n",
+			"# nws block — managed by nws; do not edit\n",
+			"  outputs = { ... }@inputs:\n",
+			"  {\n",
+			"# /nws block\n",
+			"    # devShells are user outputs below the marker\n",
+			"    description = \"devShells live here\";\n",
+			"  };\n",
+			"}\n",
+		},
+	)
+	defer delete(comment_zone)
+	testing.expect_value(t, core.user_zone_has_devshell(comment_zone), false)
+
+	// No nws block at all, user devShell in a plain flake → true.
+	plain := strings.clone(
+		"{\n  outputs = { }:\n  {\n    devShells.x86_64-linux.default = 1;\n  };\n}\n",
+	)
+	defer delete(plain)
+	testing.expect_value(t, core.user_zone_has_devshell(plain), true)
+}

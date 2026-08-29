@@ -413,3 +413,60 @@ test_workspace_config_clone_flake :: proc(t: ^testing.T) {
 		"flake clone should equal original",
 	)
 }
+
+// devShellPackages survives the save/load JSON round-trip on an overlay
+// workspace (comma-free per-attr strings, order preserved).
+@(test)
+test_config_roundtrip_dev_shell_packages :: proc(t: ^testing.T) {
+	dir, _ := os.temp_dir(context.allocator)
+	defer delete(dir)
+	path := fmt.tprintf("%s/nws-config-devshell.json", dir)
+	defer os.remove(path)
+
+	cfg := core.Config {
+		port = 17424,
+	}
+	cfg.workspaces = make([dynamic]core.Workspace_Config)
+	defer core.delete_workspaces(&cfg)
+	ws := core.Workspace_Config {
+		name     = strings.clone("/tmp/overlay ws"),
+		kind     = .overlay,
+		resolver = strings.clone("/tmp/resolver.sh"),
+	}
+	append(
+		&ws.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:lopsided98/nix-ros-overlay/ros1-25.05"),
+			attr_path = strings.clone("legacyPackages.x86_64-linux.noetic"),
+			is_flake = true,
+		},
+	)
+	pkgs := []string{"ros-base", "gazebo-ros-pkgs", "xacro"}
+	for p in pkgs {
+		append(&ws.dev_shell_packages, strings.clone(p))
+	}
+	append(&cfg.workspaces, ws)
+
+	if !core.save_config(path, cfg) {
+		testing.expectf(t, false, "save_config failed for %q", path)
+		return
+	}
+	loaded, ok := core.load_config(path)
+	defer core.delete_workspaces(&loaded)
+	testing.expectf(t, ok, "load_config should succeed")
+	testing.expectf(t, len(loaded.workspaces) == 1, "expected 1 workspace")
+	lw := loaded.workspaces[0]
+	testing.expectf(t, lw.kind == .overlay, "expected overlay kind")
+	testing.expectf(t, len(lw.dev_shell_packages) == 3, "expected 3 dev shell packages")
+	testing.expectf(
+		t,
+		lw.dev_shell_packages[0] == "ros-base" &&
+		lw.dev_shell_packages[1] == "gazebo-ros-pkgs" &&
+		lw.dev_shell_packages[2] == "xacro",
+		"devShellPackages order lost: %v",
+		lw.dev_shell_packages,
+	)
+	text := core.build_config_json(loaded)
+	defer delete(text)
+	testing.expectf(t, strings.contains(text, "\"devShellPackages\""), "JSON key missing")
+}

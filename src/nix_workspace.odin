@@ -132,6 +132,9 @@ print_usage :: proc() {
 	fmt.println(
 		"                          [--overlay-attr NAME] [--no-flake] [--nixpkgs URL] [--resolver PATH]",
 	)
+	fmt.println(
+		"                          [--dev-shell-packages A,B,C]     generate a managed devShell (overlay)",
+	)
 	fmt.println("  nws unregister [PATH]   remove a workspace")
 	fmt.println("  nws list                list registered workspaces")
 	fmt.println("  nws help                show this help")
@@ -232,10 +235,13 @@ tcp_request :: proc(port: int, line: string) -> (ok: bool, data: string) {
 
 // register_options holds the parsed CLI flags of `nws register`.
 Register_Options :: struct {
-	path:     string,
-	overlays: [dynamic]core.Overlay_Entry,
-	nixpkgs:  string,
-	resolver: string,
+	path:               string,
+	overlays:           [dynamic]core.Overlay_Entry,
+	nixpkgs:            string,
+	resolver:           string,
+	// dev_shell_packages: comma-split attr names for the managed devShell
+	// (non-empty ⇒ nws generates devShells.<system>.default).
+	dev_shell_packages: [dynamic]string,
 }
 
 cmd_register :: proc(argv: []string) {
@@ -244,6 +250,12 @@ cmd_register :: proc(argv: []string) {
 		return // parse_register_flags already printed the error
 	}
 	defer delete(opts.overlays)
+	defer {
+		for p in opts.dev_shell_packages {
+			delete(p)
+		}
+		delete(opts.dev_shell_packages)
+	}
 
 	port := client_port()
 	path := resolve_path(opts.path)
@@ -258,6 +270,9 @@ cmd_register :: proc(argv: []string) {
 	if len(opts.overlays) > 0 {
 		req.is_overlay = true
 		req.overlays = opts.overlays
+	}
+	if len(opts.dev_shell_packages) > 0 {
+		req.dev_shell_packages = opts.dev_shell_packages
 	}
 	enc := core.register_encode(&req)
 	defer delete(enc)
@@ -282,7 +297,7 @@ parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: boo
 	fail :: proc(msg: string) {
 		fmt.eprintln("nws register:", msg)
 		fmt.eprintln(
-			"usage: nws register [PATH] [--overlay URL --attr-path ATTR ...] [--overlay-attr NAME] [--no-flake] [--nixpkgs URL] [--resolver PATH]",
+			"usage: nws register [PATH] [--overlay URL --attr-path ATTR ...] [--overlay-attr NAME] [--no-flake] [--nixpkgs URL] [--resolver PATH] [--dev-shell-packages A,B,C]",
 		)
 	}
 
@@ -339,6 +354,23 @@ parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: boo
 				return opts, false
 			}
 			opts.resolver = argv[i + 1]
+			i += 2
+		case "--dev-shell-packages":
+			if i + 1 >= len(argv) {
+				fail("--dev-shell-packages requires a comma-separated list")
+				return opts, false
+			}
+			parts, perr := strings.split(argv[i + 1], ",", context.allocator)
+			if perr != nil {
+				fail("could not split --dev-shell-packages")
+				return opts, false
+			}
+			for part in parts {
+				if len(part) > 0 {
+					append(&opts.dev_shell_packages, strings.clone(part, context.allocator))
+				}
+			}
+			delete(parts)
 			i += 2
 		case:
 			if strings.has_prefix(a, "--") {
@@ -671,6 +703,12 @@ route_command :: proc(state: ^Daemon_State, line: string) -> string {
 						is_flake = ov.is_flake,
 					},
 				)
+			}
+			if len(req.dev_shell_packages) > 0 {
+				wscfg.dev_shell_packages = make([dynamic]string, 0, len(req.dev_shell_packages))
+				for p in req.dev_shell_packages {
+					append(&wscfg.dev_shell_packages, strings.clone(p))
+				}
 			}
 			have_cfg = true
 		}
@@ -1170,12 +1208,52 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 		log_line(state.logging, "warning: %s", merge_warn)
 	}
 
-	block := core.generate_overlay_block(matched, cfg)
+	// Read the existing file BEFORE generating so the managed-devShell
+	// decision can see the user-owned zone (the create path has none).
+	existing, rerr := os.read_entire_file(fl_path, context.allocator)
+	existed := rerr == nil
+	defer if existed {
+		delete(existing)
+	}
+
+	// Managed-devShell decision. With dev_shell_packages configured, nws
+	// emits a devShells.<system>.default (standard nix-ros-overlay pattern)
+	// INSIDE its block — unless the user already owns a devShell below the
+	// block, in which case emitting would duplicate the attribute (eval
+	// error). User content always wins: plain user devShell without markers →
+	// nws skips and logs; with the nested devShell block markers present →
+	// nws manages just that nested region instead (PATCH mode).
+	emit_devshell := len(cfg.dev_shell_packages) > 0
+	has_inner := false
+	if emit_devshell && existed {
+		_, _, has_inner = core.find_devshell_block(string(existing))
+		if has_inner {
+			// Nested markers: manage the inner env binding only; the user's
+			// outer devShell definition stays user-owned.
+			emit_devshell = false
+		} else if core.user_zone_has_devshell(string(existing)) {
+			emit_devshell = false
+			log_line(
+				state.logging,
+				"workspace %s: user devShell present without nws devShell markers — nws devShell skipped; add the markers inside your devShell to let nws manage its env",
+				fl_path,
+			)
+		}
+	}
+	if emit_devshell && !core.has_flake_overlay(cfg) && len(cfg.nixpkgs_url) == 0 {
+		emit_devshell = false
+		log_line(
+			state.logging,
+			"workspace %s: nws devShell skipped — no nixpkgs input (non-flake overlay without --nixpkgs)",
+			fl_path,
+		)
+	}
+
+	block := core.generate_overlay_block(matched, cfg, emit_devshell = emit_devshell)
 	defer delete(block)
 
 	// Shared write policy (same as the flake backend): create-or-patch + byte-skip.
-	existing, rerr := os.read_entire_file(fl_path, context.allocator)
-	if rerr != nil {
+	if !existed {
 		// No root flake yet: create a minimal file wrapping the block.
 		new_text, ok := core.patch_flake("", block)
 		if ok && len(new_text) > 0 {
@@ -1184,7 +1262,6 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 		delete(new_text)
 		return
 	}
-	defer delete(existing)
 
 	new_text, ok := core.patch_flake(string(existing), block)
 	if !ok {
@@ -1197,6 +1274,24 @@ sync_workspace_overlay :: proc(state: ^Daemon_State, path: string, cfg: core.Wor
 		return
 	}
 	defer delete(new_text)
+
+	// PATCH mode: fill the nested devShell block with the current env
+	// binding (children + configured extras).
+	if len(cfg.dev_shell_packages) > 0 && has_inner {
+		fragment := core.build_devshell_fragment(matched, cfg)
+		defer delete(fragment)
+		rewritten, rw_ok := core.patch_devshell_block(new_text, fragment)
+		if !rw_ok {
+			log_line(
+				state.logging,
+				"not managing %s: devShell markers malformed (fail-open)",
+				fl_path,
+			)
+			return
+		}
+		delete(new_text)
+		new_text = rewritten
+	}
 
 	if string(existing) == new_text {
 		return // loop guard on PATCHED result

@@ -18,11 +18,14 @@ import "core:strings"
 // (no '?') decodes to a plain flake-kind workspace path.
 
 Register_Request :: struct {
-	path:        string,
-	overlays:    [dynamic]Overlay_Entry,
-	nixpkgs_url: string,
-	resolver:    string,
-	is_overlay:  bool,
+	path:               string,
+	overlays:           [dynamic]Overlay_Entry,
+	nixpkgs_url:        string,
+	resolver:           string,
+	// dev_shell_packages: extra spliced-scope attr names for the managed
+	// devShell (non-empty ⇒ nws manages devShells.<system>.default).
+	dev_shell_packages: [dynamic]string,
+	is_overlay:         bool,
 }
 
 // register_encode builds the full REGISTER line (without trailing newline)
@@ -67,6 +70,14 @@ register_encode :: proc(req: ^Register_Request, allocator := context.allocator) 
 		strings.write_string(&b, "&resolver=")
 		seg = pct_encode_strict(req.resolver, allocator)
 		strings.write_string(&b, seg)
+		delete(seg)
+	}
+	if len(req.dev_shell_packages) > 0 {
+		strings.write_string(&b, "&devShellPackages=")
+		joined := strings.join(req.dev_shell_packages[:], ",", allocator)
+		seg = pct_encode_strict(joined, allocator)
+		strings.write_string(&b, seg)
+		delete(joined)
 		delete(seg)
 	}
 	out := strings.to_string(b)
@@ -206,6 +217,27 @@ register_parse :: proc(
 				return req, false
 			}
 			req.resolver = dv
+		case "devShellPackages":
+			dv, vok := decode(val, allocator)
+			if !vok {
+				register_parse_abort(&req)
+				return req, false
+			}
+			parts, perr := strings.split(dv, ",", allocator)
+			if perr != nil {
+				delete(dv)
+				register_parse_abort(&req)
+				return req, false
+			}
+			// strings.split returns VIEWS into dv — clone each part BEFORE
+			// deleting dv (freeing its backing would expose freed memory).
+			for part in parts {
+				if len(part) > 0 {
+					append(&req.dev_shell_packages, strings.clone(part, allocator))
+				}
+			}
+			delete(parts)
+			delete(dv)
 		case:
 		// Unknown parameter: ignore (fail-open forward compatibility).
 		}
@@ -235,6 +267,12 @@ register_free :: proc(req: ^Register_Request) {
 	}
 	if req.overlays != nil {
 		delete(req.overlays)
+	}
+	for p in req.dev_shell_packages {
+		delete(p)
+	}
+	if req.dev_shell_packages != nil {
+		delete(req.dev_shell_packages)
 	}
 	if len(req.nixpkgs_url) > 0 {
 		delete(req.nixpkgs_url)

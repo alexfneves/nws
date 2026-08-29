@@ -575,3 +575,79 @@ test_overlay_flake_cascade_channel :: proc(t: ^testing.T) {
 		"unexpected inputs section in channel mode",
 	)
 }
+
+// The managed devShell follows the standard nix-ros-overlay pattern: mkShell +
+// spliced0.buildEnv env with children FIRST (clone builds win collisions),
+// ignoreCollisions (children's propagated deps contain the overlay's original
+// siblings), no shellHook, no env-var manipulation.
+@(test)
+test_overlay_flake_devshell_emission :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	append(&cfg.dev_shell_packages, strings.clone("ros-base"))
+	append(&cfg.dev_shell_packages, strings.clone("gazebo-ros-pkgs"))
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child {
+		{name = "tf2", rel_path = "tf2"},
+		{name = "tf2_msgs", rel_path = "ros/tf2_msgs"},
+	}
+
+	got := core.generate_overlay_block(children, cfg, emit_devshell = true)
+	defer delete(got)
+
+	testing.expect(
+		t,
+		strings.contains(got, "devShells.x86_64-linux.default = let"),
+		"devShells attr missing",
+	)
+	testing.expect(
+		t,
+		strings.contains(got, `pkgsN = import inputs.nixpkgs { system = "x86_64-linux"; };`),
+		"pkgsN binding missing",
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "ignoreCollisions = true;"),
+		"ignoreCollisions missing",
+	)
+	testing.expect(t, strings.contains(got, "packages = [ env ];"), "standard shape missing")
+	testing.expect(t, strings.contains(got, "spliced0.gazebo-ros-pkgs"), "extra missing")
+	testing.expect(
+		t,
+		!strings.contains(got, "shellHook") && !strings.contains(got, "export "),
+		"devShell must not manipulate the environment",
+	)
+	// Children first: the clone builds must precede configured extras so the
+	// env's collision resolution keeps them.
+	idx_tf2 := strings.index(got, "spliced0.tf2\n")
+	idx_ros := strings.index(got, "spliced0.ros-base")
+	testing.expect(t, idx_tf2 >= 0 && idx_ros > idx_tf2, "children must precede extras in paths")
+
+	// emit_devshell = false → no devShell attr at all.
+	none := core.generate_overlay_block(children, cfg, emit_devshell = false)
+	defer delete(none)
+	testing.expect(t, !strings.contains(none, "devShells."), "no devShell expected")
+}
+
+// No nixpkgs input (all non-flake overlays, no nixpkgs.url) → the devShell
+// attr is skipped fail-open even when requested.
+@(test)
+test_overlay_flake_devshell_skipped_without_nixpkgs_input :: proc(t: ^testing.T) {
+	cfg := core.Workspace_Config {
+		kind = .overlay,
+	}
+	append(
+		&cfg.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("https://example.com/overlay.tar.gz"),
+			attr_path = strings.clone("pkgs"),
+			is_flake = false,
+		},
+	)
+	append(&cfg.dev_shell_packages, strings.clone("ros-base"))
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child{{name = "tf2", rel_path = "tf2"}}
+
+	got := core.generate_overlay_block(children, cfg, emit_devshell = true)
+	defer delete(got)
+	testing.expect(t, !strings.contains(got, "devShells."), "devShell must be skipped")
+}

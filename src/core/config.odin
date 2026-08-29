@@ -23,11 +23,17 @@ Overlay_Entry :: struct {
 // Workspace_Config is one entry of Config.workspaces. Legacy configs stored
 // bare path strings; those load as kind = .flake with no overlays.
 Workspace_Config :: struct {
-	name:        string,
-	kind:        Workspace_Kind,
-	overlays:    [dynamic]Overlay_Entry,
-	nixpkgs_url: string, // "" = nixpkgs cascade decides (see plan)
-	resolver:    string, // "" = built-in scan only
+	name:               string,
+	kind:               Workspace_Kind,
+	overlays:           [dynamic]Overlay_Entry,
+	nixpkgs_url:        string, // "" = nixpkgs cascade decides (see plan)
+	resolver:           string, // "" = built-in scan only
+	// dev_shell_packages lists EXTRA spliced-scope attribute names (beyond the
+	// matched children, which are always included) to merge into the
+	// nws-managed devShell's env. Non-empty ⇒ nws generates/maintains a
+	// devShells.<system>.default following the standard nix-ros-overlay
+	// pattern (mkShell + buildEnv env; no env-var shellHook).
+	dev_shell_packages: [dynamic]string,
 }
 
 // Config holds the persisted daemon settings.
@@ -155,6 +161,18 @@ parse_workspace_entry :: proc(
 		#partial switch rs in rs_v {
 		case json.String:
 			ws.resolver = strings.clone(rs, allocator)
+		}
+	}
+
+	if dp_v, has := obj["devShellPackages"]; has {
+		#partial switch arr in dp_v {
+		case json.Array:
+			for ev in arr {
+				#partial switch s in ev {
+				case json.String:
+					append(&ws.dev_shell_packages, strings.clone(s, allocator))
+				}
+			}
 		}
 	}
 
@@ -313,6 +331,16 @@ write_workspace_object :: proc(
 			fmt.tprintf("    \"nixpkgs\": \"%s\",\n", json_escape(ws.nixpkgs_url, allocator)),
 		)
 	}
+	if len(ws.dev_shell_packages) > 0 {
+		strings.write_string(b, "    \"devShellPackages\": [")
+		for p, i in ws.dev_shell_packages {
+			if i > 0 {
+				strings.write_string(b, ", ")
+			}
+			strings.write_string(b, fmt.tprintf("\"%s\"", json_escape(p, allocator)))
+		}
+		strings.write_string(b, "]\n")
+	}
 	strings.write_string(b, "  }")
 }
 
@@ -343,6 +371,12 @@ clone_workspace_config :: proc(
 			)
 		}
 	}
+	if len(ws.dev_shell_packages) > 0 {
+		out.dev_shell_packages = make([dynamic]string, 0, len(ws.dev_shell_packages), allocator)
+		for p in ws.dev_shell_packages {
+			append(&out.dev_shell_packages, strings.clone(p, allocator))
+		}
+	}
 	return out
 }
 
@@ -367,6 +401,12 @@ delete_workspace_config :: proc(ws: Workspace_Config) {
 	}
 	if ws.overlays != nil {
 		delete(ws.overlays)
+	}
+	for p in ws.dev_shell_packages {
+		delete(p)
+	}
+	if ws.dev_shell_packages != nil {
+		delete(ws.dev_shell_packages)
 	}
 	if len(ws.nixpkgs_url) > 0 {
 		delete(ws.nixpkgs_url)
@@ -394,6 +434,14 @@ workspace_configs_equal :: proc(a, b: Workspace_Config) -> bool {
 		   x.attr_path != y.attr_path ||
 		   x.overlay_attr != y.overlay_attr ||
 		   x.is_flake != y.is_flake {
+			return false
+		}
+	}
+	if len(a.dev_shell_packages) != len(b.dev_shell_packages) {
+		return false
+	}
+	for i in 0 ..< len(a.dev_shell_packages) {
+		if a.dev_shell_packages[i] != b.dev_shell_packages[i] {
 			return false
 		}
 	}

@@ -27,7 +27,9 @@ the whole run). From the repo root it:
 5. waits for nws to discover the packages and generate `flake.nix`,
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child),
-7. deletes the workspace and stops the daemon.
+7. **holds** — the workspace and daemon stay up and the script prints
+   `cd $WS && nix build`; press **Ctrl+C** to stop the daemon, unregister the
+   workspace and delete the folder (the `clean` trap does it).
 
 ## Run
 
@@ -38,8 +40,9 @@ bash run.sh
 ```
 
 It prints the generated `flake.nix` header and the number of spliced children,
-then runs the build. Exit 0 + a `SUCCESS` line means `nix build` completed with
-no errors.
+then runs the build. After a successful build the script **holds**: the
+daemon keeps watching the workspace and the folder stays on disk. Press
+**Ctrl+C** to clean up (stop daemon, unregister, delete the workspace).
 
 ## How it works
 

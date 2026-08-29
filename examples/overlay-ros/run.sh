@@ -33,11 +33,12 @@ DAEMON_LOG="/tmp/nws_example_overlay_daemon.log"
 
 clean() {
   set +e
+  echo "==> cleaning up (unregister + stop daemon + rm workspace)"
   "$NWS" unregister "$WS" </dev/null >/dev/null 2>&1
   pkill -f "$NWS service" 2>/dev/null
   rm -rf "$WS"
 }
-trap clean EXIT
+trap clean EXIT INT TERM
 
 echo "==> nws binary: $NWS  (exists: $([ -e "$NWS" ] && echo yes || echo NO))"
 [ -f "$NWS" ] || { echo "FATAL: $NWS missing — run 'nix build .#main' from the repo root first"; exit 1; }
@@ -91,6 +92,16 @@ echo "==> nix build ..."
 cd "$WS"
 nix build --extra-experimental-features 'nix-command flakes' 2>&1 | tail -30
 
+# 7. everything is up — hand the workspace to the user.
+# The daemon keeps watching it (regenerating flake.nix on edits/clones) and
+# the workspace stays on disk until the user presses Ctrl+C, at which point
+# the clean() trap deletes the folder and stops the daemon.
+echo
 echo "==> SUCCESS"
-
-# trap removes workspace + daemon
+echo "==> Workspace ready at:    $WS"
+echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
+echo "==> Try it:  cd $WS  &&  nix build"
+echo "==> Press Ctrl+C to stop the daemon and delete the workspace."
+while true; do
+  sleep 3600
+done

@@ -36,6 +36,11 @@ the whole run). From the repo root it:
 5. waits for nws to discover the packages and generate `flake.nix` — the
    generated flake splices every cloned package (src-override) **and** carries
    the nws-generated devShell in its managed block,
+5b. **switches the devShell to PATCH mode** and adds the gazebo-GUI layer:
+   run.sh appends a user devShell (below the block's END marker, carrying the
+   nws devShell block markers) whose shellHook hands gzclient a closure-ABI
+   mesa + the xcb Qt plugin — so the gazebo window renders even on hosts whose
+   system glibc is newer than the overlay pin's (see the GUI-quirk note below),
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child;
    best-effort — a failure here does not block `nix develop`),
@@ -127,11 +132,11 @@ You now have a gazebo window with a virtual TurtleBot (URDF from
 > NixOS after a system update), the gazebo GUI's OGRE can't create a GLX
 > visual: glvnd dlopens the system mesa, whose `libgallium` demands the newer
 > glibc, and `gzclient` segfaults — while `gzserver` keeps running headless.
-> The fix is a user-owned shellHook on top of the nws devShell (nws never
-> emits one): add `pkgsN.mesa` to the env's paths and export
-> `LD_LIBRARY_PATH`/`LIBGL_DRIVERS_PATH`/`QT_QPA_PLATFORM=xcb`. See the nested
-> devShell block section below for how to keep nws managing the env while you
-> own the shellHook.
+> `run.sh` covers this automatically (step 5b above): it switches the nws
+> devShell into PATCH mode and adds a user-owned shellHook that exports
+> `LD_LIBRARY_PATH`/`LIBGL_DRIVERS_PATH` pointing at `pkgsN.mesa` and
+> `QT_QPA_PLATFORM=xcb` — nws still manages the env binding, the GUI fix stays
+> user territory.
 
 ### Proving nws is doing the work
 

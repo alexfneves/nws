@@ -58,8 +58,9 @@ workspace, nothing is deleted, and the folder is never de-registered. It:
    ```
    — see "The explicit `--nixpkgs` wire detail" below,
 3. clones the two pure-python modules:
-   **`psf/requests`** (branch `main`) into `./requests` and
-   **`python/typing_extensions`** (branch `main`) into `./typing_extensions`
+   **`psf/requests`** (default branch `main`) into `./requests` and
+   **`python/typing_extensions`** at **tag `4.16.0`** (the exact version the
+   nixpkgs pin expects — see the Drift caveat) into `./typing_extensions`
    — plain directories, no flake needed, since these packages are python
    *modules*, not flakes:
 4. waits for nws to discover the clones and generate `flake.nix` — both are
@@ -185,7 +186,8 @@ grep, runs the build, then prints what to do next.
 
 **Re-running** the script in the same folder is safe: the registration is
 skipped (`nws list` already shows the folder) and the existing clones are
-reused. The script never de-registers. If you want to point the workspace at
+reused (a pinned clone is best-effort moved back onto its tag). The script
+never de-registers. If you want to point the workspace at
 **different example parameters** (overlay URL, attrPath, dev shell extras), a
 re-register does *not* update the old config — de-register first, then
 re-run:
@@ -246,17 +248,26 @@ splice.
 ## Drift caveat
 
 The overlay pins nixpkgs (so `python312Packages` is some known revision),
-but your clones are `git clone --depth 1` of **`main` at clone time**
-(`psf/requests` migrated its default branch from `master` to `main`
-upstream — run.sh tracks the current default). The classic breakage: nws
-builds the src-overridden module with nixpkgs's derivation, whose pinned
-version is hardcoded; nixpkgs's `pythonMetadataCheckPhase` then compares it
-against the clone's own metadata. If `main` has moved past the pin (e.g.
-typing_extensions `main` reports `4.16.1.dev0` while the pin is `4.16.0`),
-that phase fails and the build breaks — the splice itself worked, only the
-version drifted. Fix: pull to sync, or pin the clone to the revision the pin
-points at, e.g. `git -C typing_extensions checkout 4.16.0` (the tag matching
-`python312Packages.typing-extensions` — check with
+and the example's **default flow** keeps every clone at the exact revision
+that pin expects. `psf/requests` tracks its **default branch** `main`
+(upstream moved it from `master` — requests has no `master` branch; `main`
+is its default), while `python/typing_extensions` is pinned to **tag
+`4.16.0`**, the exact version `python312Packages.typing-extensions` pins.
+
+Why the typing_extensions pin: nws builds the src-overridden module with
+nixpkgs's derivation, whose pinned version is hardcoded; nixpkgs's
+`pythonMetadataCheckPhase` then compares that against the clone's own
+metadata. typing_extensions `main` drifts past the pin (it reports
+`4.16.1.dev0` while the pin is `4.16.0`) and that phase fails — the splice
+itself worked, only the version drifted. run.sh's fresh clone lands directly
+on the tag (`git clone --branch 4.16.0`), and a re-run that finds the folder
+already cloned best-effort moves it back onto the tag.
+
+**Bump the pin, bump the clone tag — and vice versa.** If you point the
+workspace at a newer nixpkgs input (`register ... --nixpkgs <ref>`), or
+nixpkgs itself bumps `typing-extensions`, update the `4.16.0` tag in run.sh's
+`clone_or_skip` call to match (check the current pin with
 `nix eval --raw github:NixOS/nixpkgs#legacyPackages.x86_64-linux.python312Packages.typing-extensions.version`).
-run.sh records a build failure non-fatally so the workspace stays
-inspectable, and the generated flake always evals regardless.
+The generated flake always evals regardless; run.sh records a build failure
+non-fatally (a source-merge failure of a clone would show up there) so the
+workspace stays inspectable.

@@ -23,9 +23,14 @@
 #      with a black shell env over the spliced children)
 #   3. clone the two pure-python modules into THIS folder:
 #        psf/requests (branch main)             -> ./requests
-#        python/typing_extensions (branch main)  -> ./typing_extensions
+#        python/typing_extensions (tag 4.16.0)  -> ./typing_extensions
 #      (requests used to track `master`; upstream moved its default branch
 #      to `main` — clone the current default for a stable pin)
+#      (typing_extensions is pinned to 4.16.0 — the exact tag the nixpkgs
+#      --nixpkgs input pins in python312Packages: upstream main drifts past
+#      it (e.g. 4.16.1.dev0) and fails the src-override's metadata check;
+#      the tag keeps it green. Bump it together with the nixpkgs pin — see
+#      the README's Drift caveat.)
 #   4. wait for nws to generate flake.nix — both children spliced in via
 #      `prev.<attr>.overrideAttrs (final: { src = ./<dir>; })`
 #   5. run `nix build` (bare: the generated packages.<system>.default is a
@@ -63,8 +68,13 @@ register_or_skip \
 # plain directories (no flake needed) — these packages are python MODULES,
 # not flakes, so the src-override is what splices them in.
 clone_or_skip main https://github.com/psf/requests.git requests
-clone_or_skip main https://github.com/python/typing_extensions.git typing_extensions
-echo "==> clones ready (requests@main, typing_extensions@main)"
+# typing_extensions: pin the clone to the tag the nixpkgs pin expects
+# (4.16.0). Upstream main drifts past the pin (clone reports 4.16.1.dev0 vs
+# pin 4.16.0) and fails pythonMetadataCheckPhase — the tag keeps the
+# src-override metadata check green (see the README's Drift caveat). Bump it
+# together with the --nixpkgs input pin.
+clone_or_skip main https://github.com/python/typing_extensions.git typing_extensions 4.16.0
+echo "==> clones ready (requests@main, typing_extensions@4.16.0 (tag = nixpkgs pin))"
 
 # 4. wait for nws to splice the clones (the number of NAME<tab>RELPATH lines
 # the resolver emits over the finished clones — requests + typing-extensions).

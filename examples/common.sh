@@ -173,13 +173,29 @@ copy_resolver() {
 }
 
 # --- clones: skip if the directory already exists (re-run friendly) -----------
+# clone_or_skip <branch> <url> <name> [<tag>]: clones the branch, or the
+# optional <tag> (a revision/tag name) when given — a fresh clone lands
+# directly on it (--branch accepts tag names), and a re-run where the dir
+# already exists best-effort moves the pre-existing clone back onto it
+# (masked: a shallow branch clone has no tag refs until fetched).
 clone_or_skip() {
-  local branch="$1" url="$2" name="$3"
+  local branch="$1" url="$2" name="$3" tag="${4:-}"
   if [ -d "$name" ]; then
+    if [ -n "$tag" ]; then
+      # the pre-existing clone is re-used, but move it onto the tag: fetch
+      # the tag ref first (a shallow branch clone has none locally) then
+      # checkout. Masked — a clone whose remote lacks the tag stays put.
+      git -C "$name" fetch --quiet --depth 1 origin tag "$tag" 2>/dev/null || true
+      git -C "$name" checkout --quiet "$tag" 2>/dev/null || true
+    fi
     echo "==> $name already present — skipping clone"
     return 0
   fi
-  git clone --depth 1 --branch "$branch" "$url" "$name"
+  if [ -n "$tag" ]; then
+    git clone --depth 1 --branch "$tag" "$url" "$name"
+  else
+    git clone --depth 1 --branch "$branch" "$url" "$name"
+  fi
 }
 
 # --- wait for nws to splice every resolver-emitted child ----------------------

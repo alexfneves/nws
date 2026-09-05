@@ -9,13 +9,18 @@
 #     resolver is copied here, and this folder is registered. The script
 #     refuses to run from the nws repo root (AGENTS.md + examples/ present)
 #     so the repo's own flake.nix can never be clobbered by an accident.
-#   * Daemon policy: probe with `nws list`. If a daemon is reachable it is
-#     USED — never killed, never restarted. Otherwise one is spawned
-#     (`nws service > /tmp/nws-example-<name>-daemon.log 2>&1 &`) and an
-#     EXIT/INT/TERM trap kills ONLY that PID (kill -0-guarded, then wait) —
-#     never process-kills anything it did not start. Passing --hold (or
-#     HOLD=1) keeps the spawned daemon alive and holds instead of exiting
-#     (then no kill-trap is registered at all).
+#   * Daemon policy: probe liveness on the WIRE — a live daemon answers a
+#     raw `LIST` request with `OK <count>...` (list_reply). The probe reads
+#     that reply directly: every nws client command exits 0 even against a
+#     dead daemon (it prints an error and returns), AND `nws list`'s client
+#     strips the OK header and prints only the workspace paths — so neither
+#     the exit code nor the client's stdout can signal reachability. If a
+#     daemon is reachable it is USED — never killed, never restarted.
+#     Otherwise one is spawned (`nws service > /tmp/nws-example-<name>-
+#     daemon.log 2>&1 &`) and an EXIT/INT/TERM trap kills ONLY that PID
+#     (kill -0-guarded, then wait) — never process-kills anything it did not
+#     start. Passing --hold (or HOLD=1) keeps the spawned daemon alive and
+#     holds instead of exiting (then no kill-trap is registered at all).
 #   * Registration is idempotent: `nws list | grep -qxF "$PWD"` skips a
 #     previous registration; a reply containing `ERROR already registered`
 #     (a race) counts as success. NEVER de-register, never delete folders.
@@ -90,8 +95,31 @@ _exit_from_signal() {
   exit 130
 }
 
+# _nws_daemon_up probes daemon liveness on the wire: connect to the control
+# socket (port from config.json, else the 17424 default) and check that the
+# raw `LIST` reply starts with `OK` (list_reply's `OK <count>`). Guarded to
+# be safe under set -euo pipefail and to leave no leaked fd. bash /dev/tcp
+# needs no nc. Connection refused or a non-OK reply = no reachable daemon.
+_nws_daemon_up() {
+  local port="17424" line="" cfg="$HOME/.config/nws/config.json"
+  if [ -f "$cfg" ]; then
+    port="$(sed -n 's/^[[:space:]]*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -1)"
+    port="${port:-17424}"
+  fi
+  if ! { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then return 1; fi
+  printf 'LIST\n' >&3
+  IFS= read -r line <&3 || true
+  exec 3>&- 2>/dev/null || true
+  [[ "$line" == OK* ]]
+}
+
 ensure_daemon() {
-  if "$NWS_BIN" list >/dev/null 2>&1; then
+  # Liveness probe: the raw LIST reply must start with `OK`. The exit code
+  # is NOT a probe — every nws client command returns 0 even when the daemon
+  # is unreachable (it prints an error and returns), which would make us
+  # silently use a dead daemon and never spawn our own. And `nws list`'s
+  # client strips the OK header, so only the wire reply carries it.
+  if _nws_daemon_up; then
     echo "==> nws daemon already running — using it (never killed or restarted)"
     return 0
   fi
@@ -107,13 +135,13 @@ ensure_daemon() {
   fi
   local i
   for i in $(seq 1 50); do
-    if "$NWS_BIN" list >/dev/null 2>&1; then
+    if _nws_daemon_up; then
       echo "==> daemon ready"
       return 0
     fi
     sleep 0.2
   done
-  echo "WARN: the spawned daemon did not answer 'nws list' — continuing anyway" >&2
+  echo "WARN: the spawned daemon did not answer LIST with OK — continuing anyway" >&2
 }
 ensure_daemon
 
@@ -136,8 +164,11 @@ register_or_skip() {
 }
 
 # --- resolver copy (idempotent overwrite into the workspace folder) -----------
+# The daemon spawns the resolver directly (no shell), so the copy must stay
+# EXECUTABLE even if the source lacks +x (cp preserves the source mode).
 copy_resolver() {
   cp "$1" "$WS/nws-resolver.sh"
+  chmod +x "$WS/nws-resolver.sh"
   echo "==> resolver copied to $WS/nws-resolver.sh"
 }
 
@@ -165,7 +196,10 @@ wait_for_splice() {
   echo "==> waiting for all $expected packages to be spliced into flake.nix ..."
   local i have=0
   for i in $(seq 1 180); do
-    have="$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null || echo 0)"
+    # grep -c prints the count AND exits 1 on zero matches; `|| true` keeps
+    # the substitution's exit status clean so HAVE is the bare "0" (an
+    # `|| echo 0` here would append a second 0 and break the -ge check).
+    have="$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null || true)"
     if [ "$have" -ge "$expected" ]; then break; fi
     touch "$WS/flake.nix" 2>/dev/null || true
     sleep 0.5

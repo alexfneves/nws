@@ -542,14 +542,18 @@ Every `run.sh` follows the same contract:
   [Build & install](#build--install). There is no `result/`-binary lookup
   anywhere in the examples.
 
-- **Daemon policy.** Each script probes for a running daemon (`nws list`):
-  if your `nws service` is already up, it is used as-is — never killed,
-  never restarted. Otherwise the script spawns one for the run (log at
-  `/tmp/nws-example-<name>-daemon.log`) and stops **only that process**
-  when it exits. Either way the registration persists — the next
-  `nws service` you start re-establishes the workspace. Pass `--hold` (or
-  `HOLD=1`) to keep an example-spawned daemon alive and hold instead of
-  exiting.
+- **Daemon policy.** Each script probes the daemon's control socket (a raw
+  `LIST` request must come back `OK <count>`; client exit codes can't be
+  trusted — they return 0 even against a dead daemon). If your `nws
+  service` is already up, it is used as-is — never killed, never restarted.
+  Otherwise the script spawns one for the run (detached in its own session,
+  log at `/tmp/nws-example-<name>-daemon.log`) and stops **only that
+  process** when it exits. A spawn that never comes up is a **hard error**
+  (the script points at the log and exits non-zero) — never a silent
+  continue. Either way the registration persists — the next `nws service`
+  you start re-establishes the workspace. Pass `--hold` (or `HOLD=1`) to
+  keep an example-spawned daemon alive and hold instead of exiting; the
+  daemon's own session means Ctrl+C stops the script but not the daemon.
 
 - **Re-running** in the same folder is safe: registration is skipped when
   the folder is already registered, and existing clones are reused. To

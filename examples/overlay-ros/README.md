@@ -76,23 +76,29 @@ bash <nws-repo>/examples/overlay-ros/run.sh
 ### Daemon policy and `--hold`
 
 The script never kills or restarts a daemon it did not start. On entry it
-probes with `nws list`: if your own daemon is running it is used as-is for the
-whole run. If none is reachable, a daemon is spawned for this run
-(`nws service`, log at `/tmp/nws-example-overlay-ros-daemon.log`); without
-`--hold` it is stopped again when the script exits. The **registration
-persists** either way — the next `nws service` you start re-establishes the
-workspace (clones and all).
+probes the daemon's control socket (a raw `LIST` request; a live daemon
+answers `OK <count>` — client exit codes can't be trusted here, they return
+0 even against a dead daemon): if your own daemon is running it is used
+as-is for the whole run. If none is reachable, a daemon is spawned for this
+run (`nws service`, detached in its own session, log at
+`/tmp/nws-example-overlay-ros-daemon.log`); if the spawned daemon does not
+come up within the readiness window the script **fails hard with the log
+path** — a missing daemon is an error, never a silent continue. Without
+`--hold` the spawned daemon is stopped again when the script exits. The
+**registration persists** either way — the next `nws service` you start
+re-establishes the workspace (clones and all).
 
-To keep the spawned daemon alive so it keeps watching the folder (old
-behaviour — handy while you iterate on the clones):
+To keep the spawned daemon alive so it keeps watching the folder (handy
+while you iterate on the clones):
 
 ```bash
 bash <nws-repo>/examples/overlay-ros/run.sh --hold   # or: HOLD=1 env
 ```
 
-With `--hold` the script loops after printing the instructions; Ctrl+C stops
-the script and the daemon it spawned keeps running (log the pid from the
-output, or find it with `pgrep -f 'nws service'`).
+With `--hold` the script loops after printing the instructions. The spawned
+daemon lives in its **own session** — a Ctrl+C stops the script and the
+daemon keeps running (stop it later with `kill <pid>` — printed above — or
+`pgrep -f 'nws service'`).
 
 ### Why every nix command needs `NIXPKGS_ALLOW_INSECURE=1 --impure`
 

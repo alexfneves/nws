@@ -5,27 +5,30 @@ nws splice your own clones of overlay packages into a configured package set.
 
 ## Prerequisites
 
-- `nix` with flakes enabled
-- `nc` (`netcat`), `git`
-- The nws binary built at the repo root:
+- `nws` **installed** — the scripts resolve it via `$NWS` (env override) or
+  `command -v nws`, and refuse to run when it's missing:
   ```bash
-  cd <repo-root>
-  nix build .#main    # → ./result/bin/nws
+  nix profile install .#main          # from the nws repo — or:
+  nix build .#main && export PATH="$PWD/result/bin:$PATH"
   ```
+- `nix` with flakes enabled, `git`
 
 ## What it does
 
-`run.sh` must be run as a **single process** (so the nws daemon stays alive for
-the whole run). From the repo root it:
+`run.sh` sets up **the current folder** as an nws workspace — no temp
+workspace, nothing is deleted, and the folder is never de-registered. It:
 
-1. starts the nws daemon,
-2. creates a temporary workspace `$WS`,
-3. registers it as an **overlay** workspace pointing at this folder's
-   `resolver.sh` — with `--dev-shell-packages ros-base,gazebo-ros-pkgs,xacro,
-   robot-state-publisher`, which tells nws to generate a `devShells.<system>.
-   default` too (see "The dev shell" below),
-4. clones **exactly two** TurtleBot repos (**noetic** branches, matching the
-   overlay pin):
+1. resolves the installed `nws` binary and checks the daemon: if one is
+   already running it is **used as-is** (never killed or restarted); otherwise
+   a daemon is spawned for this run and stopped again on exit (see "Daemon
+   policy" below),
+2. copies `resolver.sh` to `./nws-resolver.sh` and registers the current
+   folder as an **overlay** workspace pointing at it — with
+   `--dev-shell-packages ros-base,gazebo-ros-pkgs,xacro,robot-state-publisher`,
+   which tells nws to generate a `devShells.<system>.default` too (see
+   "The dev shell" below),
+3. clones **exactly two** TurtleBot repos (**noetic** branches, matching the
+   overlay pin) into the folder:
    - `turtlebot3_simulations` — the **main roslaunch** package (provides
      `turtlebot3_gazebo` / `turtlebot3_empty_world.launch` that starts gazebo),
    - `turtlebot3` — the **modifiable underneath** package (provides
@@ -33,10 +36,10 @@ the whole run). From the repo root it:
    Every other dependency is pulled in automatically: the nix build downloads
    and builds gazebo, gazebo_ros, xacro, robot_state_publisher, all the
    message/service packages, etc.
-5. waits for nws to discover the packages and generate `flake.nix` — the
+4. waits for nws to discover the packages and generate `flake.nix` — the
    generated flake splices every cloned package (src-override) **and** carries
    the nws-generated devShell in its managed block,
-5b. **switches the devShell to PATCH mode** and adds the gazebo-GUI layer:
+5. **switches the devShell to PATCH mode** and adds the gazebo-GUI layer:
    run.sh appends a user devShell (below the block's END marker, carrying the
    nws devShell block markers) whose shellHook hands gzclient a closure-ABI
    mesa + the xcb Qt plugin — so the gazebo window renders even on hosts whose
@@ -44,22 +47,52 @@ the whole run). From the repo root it:
 6. runs **`nix build`** with no arguments (the generated flake's
    `packages.<system>.default` is a `buildEnv` aggregating every spliced child;
    best-effort — a failure here does not block `nix develop`),
-7. **holds** — the workspace and daemon stay up and the script prints the
-   launch instructions; press **Ctrl+C** to stop the daemon, unregister the
-   workspace and delete the folder (the `clean` trap does it).
+7. prints the launch instructions and exits.
 
 ## Run
 
+Run from your **own empty folder** — never from the nws repo root (the script
+refuses to run there, so the repo's own `flake.nix` can never be clobbered):
+
 ```bash
-# from the example folder
-cd <repo-root>/examples/overlay-ros
-bash run.sh
+mkdir ros-demo && cd ros-demo
+bash <nws-repo>/examples/overlay-ros/run.sh
 ```
 
 It prints the generated `flake.nix` header and the number of spliced children,
-then runs the build. After a successful build the script **holds**: the
-daemon keeps watching the workspace and the folder stays on disk. Press
-**Ctrl+C** to clean up (stop daemon, unregister, delete the workspace).
+then runs the build, then prints what to run next.
+
+**Re-running** the script in the same folder is safe: the registration is
+skipped (`nws list` already shows the folder) and existing clones are reused.
+The script never de-registers. If you want to point the workspace at
+**different example parameters** (overlay URL, dev-shell packages, ...), a
+re-register does *not* update the old config — de-register first, then re-run:
+
+```bash
+nws unregister "$PWD"
+bash <nws-repo>/examples/overlay-ros/run.sh
+```
+
+### Daemon policy and `--hold`
+
+The script never kills or restarts a daemon it did not start. On entry it
+probes with `nws list`: if your own daemon is running it is used as-is for the
+whole run. If none is reachable, a daemon is spawned for this run
+(`nws service`, log at `/tmp/nws-example-overlay-ros-daemon.log`); without
+`--hold` it is stopped again when the script exits. The **registration
+persists** either way — the next `nws service` you start re-establishes the
+workspace (clones and all).
+
+To keep the spawned daemon alive so it keeps watching the folder (old
+behaviour — handy while you iterate on the clones):
+
+```bash
+bash <nws-repo>/examples/overlay-ros/run.sh --hold   # or: HOLD=1 env
+```
+
+With `--hold` the script loops after printing the instructions; Ctrl+C stops
+the script and the daemon it spawned keeps running (log the pid from the
+output, or find it with `pgrep -f 'nws service'`).
 
 ### Why every nix command needs `NIXPKGS_ALLOW_INSECURE=1 --impure`
 
@@ -81,10 +114,11 @@ NIXPKGS_ALLOW_INSECURE=1 nix build --impure       # (run.sh already does this)
 
 ## How it works
 
-- `resolver.sh` is the ecosystem-specific piece. nws stays generic: it calls the
-  script once per sync and treats each `NAME\tRELPATH` stdout line as a child to
-  splice. Here it reads every `package.xml` and emits the package's **overlay
-  attribute name** (underscores → hyphens, matching nix-ros-overlay's
+- `resolver.sh` (copied to `./nws-resolver.sh` by run.sh) is the
+  ecosystem-specific piece. nws stays generic: it calls the script once per
+  sync and treats each `NAME\tRELPATH` stdout line as a child to splice. Here
+  it reads every `package.xml` and emits the package's **overlay attribute
+  name** (underscores → hyphens, matching nix-ros-overlay's
   `turtlebot3-msgs` keys) plus its directory.
 - nws src-overrides each NAME: it emits `prev.NAME.overrideAttrs (final: { src =
   ./RELPATH; })`, so the package's **dependencies are inherited from the overlay**
@@ -95,8 +129,9 @@ NIXPKGS_ALLOW_INSECURE=1 nix build --impure       # (run.sh already does this)
 
 ## Running the gazebo simulation
 
-After `run.sh` holds (workspace ready), run in terminals (the hold keeps
-the daemon but you don't need it for the sim):
+After `run.sh` finishes (workspace ready), run in terminals (you don't need
+the daemon for the sim — and the workspace stays registered for the next
+`nws service`):
 
 ```bash
 # terminal A — the ROS master
@@ -132,7 +167,7 @@ You now have a gazebo window with a virtual TurtleBot (URDF from
 > NixOS after a system update), the gazebo GUI's OGRE can't create a GLX
 > visual: glvnd dlopens the system mesa, whose `libgallium` demands the newer
 > glibc, and `gzclient` segfaults — while `gzserver` keeps running headless.
-> `run.sh` covers this automatically (step 5b above): it switches the nws
+> `run.sh` covers this automatically (step 5 above): it switches the nws
 > devShell into PATCH mode and adds a user-owned shellHook that exports
 > `LD_LIBRARY_PATH`/`LIBGL_DRIVERS_PATH` pointing at `pkgsN.mesa` and
 > `QT_QPA_PLATFORM=xcb` — nws still manages the env binding, the GUI fix stays

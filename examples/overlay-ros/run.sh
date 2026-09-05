@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# nws end-to-end overlay example (ROS / nix-ros-overlay).
+# nws end-to-end overlay example (ROS / nix-ros-overlay) — new-style run.sh.
 #
-# Runs, in ONE process (so the daemon stays alive the whole time):
-#   1. start the nws daemon
-#   2. create a temporary workspace folder
-#   3. register it as an overlay workspace, pointing at this dir's resolver;
+# Sets up ONLY the CURRENT folder (no temp workspace, no teardown):
+#   1. ensure an nws daemon (use the user's if one is running; only spawn our
+#      own when none is — see ../common.sh for the daemon policy and --hold)
+#   2. register THIS folder as an overlay workspace with the copied resolver;
 #      --dev-shell-packages asks nws to generate the ROS dev shell itself
-#   4. clone a couple of TurtleBot repos into it
-#   5. wait for nws to generate flake.nix
-#   5b. switch the devShell to PATCH mode (nws manages the env binding; run.sh
+#   3. clone two TurtleBot repos into THIS folder (noetic branches)
+#   4. wait for nws to generate flake.nix (every resolvable package spliced)
+#   4b. switch the devShell to PATCH mode (nws manages the env binding; run.sh
 #       adds the gazebo-GUI mesa/xcb shellHook — see inject_gui_layer below)
-#   6. run `nix build` (bare)
-#   7. HOLD; pressing Ctrl+C unregisters, stops the daemon and deletes the folder
+#   5. run `nix build` (bare, best-effort)
+#   6. print what to run next, then exit (or --hold to keep the spawned daemon)
 #
 # Philosophy: nws is GENERIC. It owns the marked nws block in the flake (the
 # region between `# nws block — managed by nws; do not edit` and
@@ -25,67 +25,25 @@
 # across regenerations (a user devShell there takes precedence over nws's,
 # fail-open).
 #
-# Use from the repo root's build artifacts:
-#   from the project root:   result/bin/nws  (built via nix build .#main)
+# Run from your OWN empty folder (common.sh refuses the nws repo root):
+#   mkdir ros-demo && cd ros-demo && bash <repo>/examples/overlay-ros/run.sh
+# Re-running in the same folder skips the registration; to point the workspace
+# at different flags, de-register it first (see the README).
 
 set -euo pipefail
+EXAMPLE_NAME=overlay-ros
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$HERE/../common.sh"
 
-# This script uses bashisms (local, $'\n', arrays). Running it via `sh run.sh`
-# (dash) silently breaks the script. Require bash explicitly.
-if [ -z "${BASH_VERSION:-}" ]; then
-  echo "ERROR: run this script with bash:  bash $0" >&2
-  exit 1
-fi
-
-# --- resolve paths relative to this script's location (no ~/gits hardcode) ---
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # examples/overlay-ros
-ROOT="$HERE"
-while [ ! -e "$ROOT/result/bin/nws" ] && [ "$ROOT" != "/" ]; do
-  ROOT="$(dirname "$ROOT")"
-done
-NWS="$ROOT/result/bin/nws"                            # built binary
-RESOLVER="$HERE/resolver.sh"                          # our package.xml mapper
-
-PORT=17424
-WS="/tmp/nws_example_overlay_ws"
-DAEMON_LOG="/tmp/nws_example_overlay_daemon.log"
-
-clean() {
-  # disarm INT/TERM/EXIT while clean runs so a Ctrl+C during cleanup does not
-  # re-trigger the trap (which caused an endless cascade of clean() calls).
-  trap - INT TERM EXIT
-  set +e
-  echo "==> cleaning up (unregister + stop daemon + rm workspace)"
-  "$NWS" unregister "$WS" </dev/null >/dev/null 2>&1
-  pkill -f "$NWS service" 2>/dev/null
-  rm -rf "$WS"
-  pkill -f "$NWS service" 2>/dev/null
-  exit 0
-}
-trap clean EXIT INT TERM
-
-echo "==> nws binary: $NWS  (exists: $([ -e "$NWS" ] && echo yes || echo NO))"
-[ -f "$NWS" ] || { echo "FATAL: $NWS missing — run 'nix build .#main' from the repo root first"; exit 1; }
-
-# 1. start the daemon (fresh)
-pkill -f "$NWS service" 2>/dev/null || true
-sleep 0.3
-"$NWS" service >"$DAEMON_LOG" 2>&1 &
-SVC_PID=$!
-for i in $(seq 1 50); do
-  if printf 'LIST\n' | nc -w 1 127.0.0.1 "$PORT" >/dev/null 2>&1; then break; fi
-  sleep 0.2
-done
-echo "==> daemon started (pid $SVC_PID)"
-
-# 2+3. create + register the workspace (idempotent: unregister first if stale)
-rm -rf "$WS"
-mkdir -p "$WS"
-"$NWS" unregister "$WS" </dev/null >/dev/null 2>&1 || true
-"$NWS" register "$WS" \
+# 2. register THIS folder (idempotent; never de-registers). The resolver is
+# copied into the folder first — nws calls it per sync, so the path passed on
+# the wire must exist at registration time.
+copy_resolver "$HERE/resolver.sh"
+register_or_skip \
   --overlay github:lopsided98/nix-ros-overlay/ros1-25.05 \
   --attr-path legacyPackages.x86_64-linux.noetic \
-  --resolver "$RESOLVER" \
+  --resolver "$WS/nws-resolver.sh" \
   --dev-shell-packages ros-base,gazebo-ros-pkgs,xacro,robot-state-publisher
 #     ^ nws generates devShells.<system>.default itself: the standard
 #       mkShell + spliced0.buildEnv pattern over the spliced children PLUS
@@ -93,10 +51,8 @@ mkdir -p "$WS"
 #       gazebo-ros-pkgs is the metapackage that also brings gazebo-plugins —
 #       the model plugins the URDF loads. xacro/robot-state-publisher are
 #       undeclared launch-time deps of turtlebot3_gazebo).
-echo "==> registered $WS"
 
-# 4. clone repos.
-# Exactly TWO clones:
+# 3. clone repos into the current folder. Exactly TWO clones:
 #   - turtlebot3_simulations: the MAIN roslaunch package — provides
 #     turtlebot3_gazebo with turtlebot3_empty_world.launch (starts gazebo).
 #   - turtlebot3: the modifiable UNDERNEATH package — provides
@@ -106,38 +62,22 @@ echo "==> registered $WS"
 # srv deps, the turtlebot3_msgs used by the model, ...) is pulled in
 # automatically: the nix build downloads/builds those dependencies. Use the
 # ROS1 `noetic` branches (ros1-25.05 pins ROS1/noetic; `master` is ROS2).
-cd "$WS"
-git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git turtlebot3-simulations
-git clone --depth 1 --branch noetic https://github.com/ROBOTIS-GIT/turtlebot3.git turtlebot3
-echo "==> cloned repos (noetic branches)"
+clone_or_skip noetic https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git turtlebot3-simulations
+clone_or_skip noetic https://github.com/ROBOTIS-GIT/turtlebot3.git turtlebot3
+echo "==> clones ready (noetic branches)"
 
-# 5. wait for nws to discover the FULL clone set (this is the number of
+# 4. wait for nws to splice the FULL clone set (this is the number of
 # NAME<tab>RELPATH lines the resolver emits over the finished clones), so the
 # generated flake splices every package — a partial set would silently fall
 # back to upstream packages for the missing ones.
-EXPECTED=$(bash "$RESOLVER" "$WS" | wc -l)
+EXPECTED="$(bash "$WS/nws-resolver.sh" "$WS" | wc -l)"
 echo "==> resolver emits $EXPECTED packages; waiting for the daemon to splice them all..."
-for i in $(seq 1 180); do
-  HAVE=$(grep -c '= prev:' "$WS/flake.nix" 2>/dev/null || echo 0)
-  if [ "$HAVE" -ge "$EXPECTED" ]; then break; fi
-  # The daemon watches ONLY the workspace ROOT (inotify is not recursive):
-  # deep file changes (touching package.xml inside a clone) wake nothing.
-  # Touch the root's own flake.nix instead — an ATTRIB/CLOSE_WRITE event on
-  # a root entry that always fires. Byte-equal skip makes it harmless.
-  touch "$WS/flake.nix" 2>/dev/null || true
-  sleep 0.5
-  if [ $((i % 20)) -eq 0 ]; then echo "    ...$HAVE/$EXPECTED spliced so far"; fi
-done
-sleep 1   # let the daemon finish a regen after the last event
-# force one final regeneration (full clone set present now)
-touch "$WS/flake.nix" 2>/dev/null || true
-sleep 1
-echo "==> generated flake.nix"
+wait_for_splice "$WS/nws-resolver.sh" "$EXPECTED"
 sed -n '1,8p' "$WS/flake.nix"
 grep -c '= prev:' "$WS/flake.nix" 2>/dev/null | xargs echo "    spliced children:"
 
 ###############################################################################
-# 5b. USER GUI LAYER: switch the devShell into PATCH mode + gazebo-GUI fix.
+# 4b. USER GUI LAYER: switch the devShell into PATCH mode + gazebo-GUI fix.
 #
 # The nws-generated devShell is deliberately env-free (the packages' own setup
 # hooks wire ROS_PACKAGE_PATH / GAZEBO_PLUGIN_PATH etc). But on hosts whose
@@ -195,7 +135,7 @@ EONIX
 }
 inject_gui_layer
 
-# 6. build (bare; default output aggregates all spliced children) — best-effort.
+# 5. build (bare; default output aggregates all spliced children) — best-effort.
 # The default buildEnv aggregates every bare-spliced child; some monorepo
 # subpackages have no declared deps and fail the debug-output split. That does
 # NOT block the nws-generated dev shell (see the register step), so do NOT let
@@ -208,7 +148,6 @@ inject_gui_layer
 # cannot reach it. The documented nixpkgs mechanism is NIXPKGS_ALLOW_INSECURE
 # + --impure, which every nixpkgs import in the eval honors. `nix develop`
 # needs the same treatment (see the banner below).
-cd "$WS"
 echo "==> nix build ... (NIXPKGS_ALLOW_INSECURE=1 --impure: lifts the freeimage gate for the overlay's internal nixpkgs)"
 set +e
 NIXPKGS_ALLOW_INSECURE=1 nix build --impure --extra-experimental-features 'nix-command flakes' 2>&1 | tail -20
@@ -216,17 +155,20 @@ NIX_BUILD_EXIT=${PIPESTATUS[0]}
 echo "==> nix build finished (exit $NIX_BUILD_EXIT) — continuing regardless"
 set -e
 
-# 7. everything is up — hand the workspace to the user.
-# nws regenerates only its block on fs events, including the devShell it
-# generated (devShells.<system>.default inside the block). User content below
-# the "# /nws block" line is byte-preserved; a user devShell there takes
-# precedence (nws logs and skips) — or the user can add the nws devShell block
-# markers inside their own devShell to let nws manage its env binding.
+# 6. everything is set up — hand the workspace to the user.
+# The registration persists: nws keeps the workspace in its config, so the
+# next `nws service` you start re-establishes it (clones and all). Nothing is
+# deleted and nothing is de-registered by this script.
 echo
 echo
 echo "==> SUCCESS"
-echo "==> Workspace ready at:    $WS"
-echo "==> Daemon running (pid: $SVC_PID) — watching it for changes."
+echo "==> Workspace registered and ready at:    $WS"
+if [ "$NWS_DAEMON_OWNED" -eq 1 ]; then
+  echo "==> Example nws daemon (pid $NWS_DAEMON_PID, log: $NWS_DAEMON_LOG)"
+  echo "    It watches $WS until this script exits — re-run with --hold to keep it."
+else
+  echo "==> Using your running nws daemon — it keeps watching $WS."
+fi
 echo
 echo "==> Run the GAZEBO simulation (see README):"
 echo "    # The dev shell was generated by nws (standard nix-ros-overlay pattern,"
@@ -262,7 +204,4 @@ echo "    robot_state_publisher, msgs, ...) are installed automatically;"
 echo "    gazebo-ros-pkgs bundles gazebo-plugins, which is what makes /cmd_vel"
 echo "    (and /odom, /scan) work in gazebo."
 echo
-echo "==> Press Ctrl+C to stop the daemon and delete the workspace."
-while true; do
-  sleep 3600
-done
+example_done

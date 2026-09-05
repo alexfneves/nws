@@ -340,29 +340,94 @@ write_overlay_body :: proc(
 	strings.write_string(b, "  in\n  {\n")
 
 	// One output attribute per configured overlay entry: the spliced set.
+	// An entry whose attrPath IS the convenience packages.<system> attr
+	// (e.g. `packages.x86_64-linux` — Hyprland-style overlays expose their
+	// package set at exactly that path) would collide with the convenience
+	// output below, so it is emitted in the MERGED form instead: the full
+	// spliced set preserved via a Nix `//` merge with the convenience body
+	// (children + default) on top — body keys win, but they are the same
+	// children already in the spliced set, plus `default` only the body has.
 	for e in 0 ..< len(cfg.overlays) {
 		ap := cfg.overlays[e].attr_path
 		if len(ap) == 0 {
 			ap = "pkgs"
 		}
 		strings.write_string(b, "    ")
-		write_attr_path(b, ap)
-		strings.write_string(b, " = spliced")
-		write_int(b, e)
-		strings.write_string(b, ";\n")
+		if attr_path_is_packages_set(ap) {
+			strings.write_string(b, ap)
+			strings.write_string(b, " = spliced")
+			write_int(b, e)
+			strings.write_string(b, " // ")
+			write_packages_default_body(b, emit, cfg, system_from_attr_path(ap))
+		} else {
+			write_attr_path(b, ap)
+			strings.write_string(b, " = spliced")
+			write_int(b, e)
+			strings.write_string(b, ";\n")
+		}
 	}
 
 	// Convenience direct-build output: packages.<system> exposing every
 	// matched child from the first configured entry. The system is taken from
 	// the attrPath when it contains a recognizable <cpu>-<os> segment,
-	// otherwise defaults to x86_64-linux.
+	// otherwise defaults to x86_64-linux. Skipped when entry 0's attrPath IS
+	// packages.<system> — the merged per-entry form above already carries the
+	// exact same body under that attr.
 	first_ap := "pkgs"
 	if len(cfg.overlays) > 0 && len(cfg.overlays[0].attr_path) > 0 {
 		first_ap = cfg.overlays[0].attr_path
 	}
-	strings.write_string(b, "    packages.")
-	strings.write_string(b, system_from_attr_path(first_ap))
-	strings.write_string(b, " = {\n")
+	sys := system_from_attr_path(first_ap)
+	if !attr_path_is_packages_set(first_ap) {
+		strings.write_string(b, "    packages.")
+		strings.write_string(b, sys)
+		strings.write_string(b, " = ")
+		write_packages_default_body(b, emit, cfg, sys)
+	}
+
+	// Managed devShell (standard nix-ros-overlay pattern, see
+	// write_devshell_attr): emitted when the workspace configures
+	// dev_shell_packages AND a nixpkgs input exists for pkgsN (follows
+	// cascade or explicit nixpkgs.url). All-non-flake overlays without a
+	// nixpkgs input skip it fail-open; the sync also suppresses emission
+	// when the user already owns a devShell (user content wins) unless they
+	// opted into the nested devShell block markers.
+	if emit_devshell && (len(cfg.nixpkgs_url) > 0 || has_flake_overlay(cfg)) {
+		write_devshell_attr(b, emit, cfg, sys)
+	}
+}
+
+// attr_path_is_packages_set reports whether path is exactly the convenience
+// `packages.<system>` output attr (e.g. `packages.x86_64-linux`): a dotted
+// path with a `packages.` prefix whose remainder is the system segment
+// system_from_attr_path extracts (i.e. a single <cpu>-<os> name). A
+// per-entry output at such a path would collide with the convenience output,
+// so it is emitted in the merged form instead.
+attr_path_is_packages_set :: proc(path: string) -> bool {
+	if !strings.has_prefix(path, "packages.") {
+		return false
+	}
+	// "packages." is 9 bytes; the remainder must be exactly the system
+	// segment (a lone <cpu>-<os> token) for the collision to hold.
+	rest := path[9:len(path)]
+	return len(rest) > 0 && rest == system_from_attr_path(path)
+}
+
+// write_packages_default_body writes the attrset body of the convenience
+// `packages.<system>` output: every matched child wired to the first entry's
+// spliced set plus the `default` buildEnv aggregation for a bare `nix build`.
+// Shared by the standalone convenience output (`packages.<sys> = ` + body)
+// and the merged form emitted when an entry's attrPath IS packages.<system>
+// (`packages.<sys> = spliced<e> // ` + body): in the merged form the body
+// keys win the `//` merge — the children are the same ones already in the
+// spliced set, and `default` exists only in the body.
+write_packages_default_body :: proc(
+	b: ^strings.Builder,
+	emit: []Overlay_Child,
+	cfg: Workspace_Config,
+	sys: string,
+) {
+	strings.write_string(b, "{\n")
 	for c in emit {
 		strings.write_string(b, "      ")
 		write_attr_key(b, c.name)
@@ -378,7 +443,6 @@ write_overlay_body :: proc(
 	// is present via the cascade chain (nixpkgs.follows) or an explicit
 	// nixpkgs.url; when neither exists (all non-flake overlays) fall back to
 	// the first child so the attribute remains a valid derivation.
-	sys := system_from_attr_path(first_ap)
 	strings.write_string(b, "      default = (if builtins.hasAttr \"nixpkgs\" inputs then\n")
 	strings.write_string(b, "        (import inputs.nixpkgs { system = \"")
 	strings.write_string(b, sys)
@@ -396,17 +460,6 @@ write_overlay_body :: proc(
 	write_attr_key(b, emit[0].name)
 	strings.write_string(b, ");\n")
 	strings.write_string(b, "    };\n")
-
-	// Managed devShell (standard nix-ros-overlay pattern, see
-	// write_devshell_attr): emitted when the workspace configures
-	// dev_shell_packages AND a nixpkgs input exists for pkgsN (follows
-	// cascade or explicit nixpkgs.url). All-non-flake overlays without a
-	// nixpkgs input skip it fail-open; the sync also suppresses emission
-	// when the user already owns a devShell (user content wins) unless they
-	// opted into the nested devShell block markers.
-	if emit_devshell && (len(cfg.nixpkgs_url) > 0 || has_flake_overlay(cfg)) {
-		write_devshell_attr(b, emit, cfg, sys)
-	}
 }
 
 // has_flake_overlay reports whether cfg has at least one flake overlay entry

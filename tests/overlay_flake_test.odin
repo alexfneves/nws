@@ -651,3 +651,66 @@ test_overlay_flake_devshell_skipped_without_nixpkgs_input :: proc(t: ^testing.T)
 	defer delete(got)
 	testing.expect(t, !strings.contains(got, "devShells."), "devShell must be skipped")
 }
+
+// An overlay entry whose attrPath IS the convenience packages.<system> attr
+// itself (Hyprland-style: `packages.x86_64-linux`) must not emit the same
+// attr twice — that would make the flake fail to eval ("attribute
+// 'packages.x86_64-linux' already defined"). The per-entry output is emitted
+// in the MERGED form (`packages.x86_64-linux = spliced0 // { ... }`): the
+// full spliced set is preserved via a Nix `//` merge and the convenience
+// children/default body rides on top (body keys win — same children, plus
+// `default` only the body has). The standalone convenience output is skipped.
+@(test)
+test_overlay_flake_packages_attrpath_no_collision :: proc(t: ^testing.T) {
+	cfg := core.Workspace_Config {
+		kind = .overlay,
+	}
+	defer core.delete_workspace_config(cfg)
+	append(
+		&cfg.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:hyprwm/hyprlang"),
+			attr_path = strings.clone("packages.x86_64-linux"),
+			is_flake = true,
+		},
+	)
+	children := []core.Overlay_Child{{name = "hyprlang", rel_path = "hyprlang"}}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	// Exactly ONE packages.x86_64-linux definition, in the merged form.
+	testing.expectf(
+		t,
+		strings.count(got, "packages.x86_64-linux =") == 1,
+		"expected exactly one packages.x86_64-linux definition:\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "    packages.x86_64-linux = spliced0 // {\n"),
+		"merged form (spliced set // convenience body) missing:\n%s",
+		got,
+	)
+	// The standalone convenience output must NOT be emitted a second time.
+	testing.expect(
+		t,
+		!strings.contains(got, "    packages.x86_64-linux = {\n"),
+		"standalone convenience output must be skipped when the attrPath collides:\n%s",
+		got,
+	)
+	// Both sides of the merge survive: the child entry and the default
+	// buildEnv are still present under the merged attr.
+	testing.expect(
+		t,
+		strings.contains(got, "hyprlang = spliced0.hyprlang;"),
+		"convenience child entry missing from the merged body:\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "default = (if builtins.hasAttr \"nixpkgs\" inputs then\n"),
+		"convenience default buildEnv missing from the merged body:\n%s",
+		got,
+	)
+}

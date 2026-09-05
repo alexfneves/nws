@@ -343,10 +343,15 @@ write_overlay_body :: proc(
 	// An entry whose attrPath IS the convenience packages.<system> attr
 	// (e.g. `packages.x86_64-linux` — Hyprland-style overlays expose their
 	// package set at exactly that path) would collide with the convenience
-	// output below, so it is emitted in the MERGED form instead: the full
+	// output, so it is emitted in the MERGED form instead: the full
 	// spliced set preserved via a Nix `//` merge with the convenience body
 	// (children + default) on top — body keys win, but they are the same
 	// children already in the spliced set, plus `default` only the body has.
+	// Only ONE such definition may exist for the attr: a later colliding
+	// entry in a multi-overlay config must not re-emit it (that would define
+	// the attr twice), and the standalone convenience output below is
+	// suppressed when ANY entry took the merged form — not just entry 0.
+	merged_taken := false
 	for e in 0 ..< len(cfg.overlays) {
 		ap := cfg.overlays[e].attr_path
 		if len(ap) == 0 {
@@ -354,6 +359,10 @@ write_overlay_body :: proc(
 		}
 		strings.write_string(b, "    ")
 		if attr_path_is_packages_set(ap) {
+			if merged_taken {
+				continue
+			}
+			merged_taken = true
 			strings.write_string(b, ap)
 			strings.write_string(b, " = spliced")
 			write_int(b, e)
@@ -370,15 +379,15 @@ write_overlay_body :: proc(
 	// Convenience direct-build output: packages.<system> exposing every
 	// matched child from the first configured entry. The system is taken from
 	// the attrPath when it contains a recognizable <cpu>-<os> segment,
-	// otherwise defaults to x86_64-linux. Skipped when entry 0's attrPath IS
-	// packages.<system> — the merged per-entry form above already carries the
-	// exact same body under that attr.
+	// otherwise defaults to x86_64-linux. Emitted ONLY when no entry's
+	// attrPath picked it up via the merged per-entry form above — the two
+	// can never coexist (that would define the attr twice).
 	first_ap := "pkgs"
 	if len(cfg.overlays) > 0 && len(cfg.overlays[0].attr_path) > 0 {
 		first_ap = cfg.overlays[0].attr_path
 	}
 	sys := system_from_attr_path(first_ap)
-	if !attr_path_is_packages_set(first_ap) {
+	if !merged_taken {
 		strings.write_string(b, "    packages.")
 		strings.write_string(b, sys)
 		strings.write_string(b, " = ")

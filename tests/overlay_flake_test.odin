@@ -714,3 +714,112 @@ test_overlay_flake_packages_attrpath_no_collision :: proc(t: ^testing.T) {
 		got,
 	)
 }
+
+// Multi-overlay configs: the packages.<sys> suppression must hold for ANY
+// colliding entry, not just entry 0. Shape 1 is the review's failing case —
+// entry 0 non-colliding (`legacyPackages.x86_64-linux.foo`) and a LATER
+// (non-zero) entry colliding (`packages.x86_64-linux`) used to emit BOTH the
+// merged per-entry form AND the standalone convenience output, a duplicate
+// "attribute 'packages.x86_64-linux' already defined" eval failure. Shape 2
+// — two entries whose attrPath is the SAME packages.<sys> — must likewise
+// define the attr exactly once (the first colliding entry wins). In both
+// shapes exactly ONE packages.x86_64-linux definition survives, in the
+// merged form; the standalone convenience output never coexists with it.
+@(test)
+test_overlay_flake_packages_attrpath_multi_overlay_collision :: proc(t: ^testing.T) {
+	children := []core.Overlay_Child{{name = "hyprlang", rel_path = "hyprlang"}}
+
+	// Shape 1: later (non-zero) entry collides while entry 0 does not.
+	cfg := core.Workspace_Config {
+		kind = .overlay,
+	}
+	defer core.delete_workspace_config(cfg)
+	append(
+		&cfg.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:example/overlay-a"),
+			attr_path = strings.clone("legacyPackages.x86_64-linux.foo"),
+			is_flake = true,
+		},
+	)
+	append(
+		&cfg.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:hyprwm/hyprlang"),
+			attr_path = strings.clone("packages.x86_64-linux"),
+			is_flake = true,
+		},
+	)
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	testing.expectf(
+		t,
+		strings.count(got, "packages.x86_64-linux =") == 1,
+		"later colliding entry must emit exactly one packages.x86_64-linux (merged form):\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "    packages.x86_64-linux = spliced1 // {\n"),
+		"the later colliding entry must take the merged form under its own spliced set:\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		!strings.contains(got, "    packages.x86_64-linux = {\n"),
+		"the standalone convenience output must be suppressed once ANY entry collides:\n%s",
+		got,
+	)
+	testing.expect(
+		t,
+		strings.contains(got, "    legacyPackages.x86_64-linux.foo = spliced0;\n"),
+		"the non-colliding entry's own output attr must stay untouched:\n%s",
+		got,
+	)
+
+	// Shape 2: two entries whose attrPath IS the same packages.<sys>.
+	cfg2 := core.Workspace_Config {
+		kind = .overlay,
+	}
+	defer core.delete_workspace_config(cfg2)
+	append(
+		&cfg2.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:hyprwm/hyprlang"),
+			attr_path = strings.clone("packages.x86_64-linux"),
+			is_flake = true,
+		},
+	)
+	append(
+		&cfg2.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:hyprwm/hyprutils"),
+			attr_path = strings.clone("packages.x86_64-linux"),
+			is_flake = true,
+		},
+	)
+
+	got2 := core.generate_overlay_root_flake(children, cfg2)
+	defer delete(got2)
+
+	testing.expectf(
+		t,
+		strings.count(got2, "packages.x86_64-linux =") == 1,
+		"duplicate colliding entries must define the attr exactly once:\n%s",
+		got2,
+	)
+	testing.expect(
+		t,
+		strings.contains(got2, "    packages.x86_64-linux = spliced0 // {\n"),
+		"the merged form must come from the first colliding entry:\n%s",
+		got2,
+	)
+	testing.expect(
+		t,
+		!strings.contains(got2, "= spliced1 // "),
+		"the second colliding entry must NOT re-emit the attr:\n%s",
+		got2,
+	)
+}

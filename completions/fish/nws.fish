@@ -1,6 +1,6 @@
 # fish completion for nws (Nix Workspace Root Manager).
 # Auto-loaded from vendor_completions.d. Tracks `nws help`'s subcommand list:
-# service register unregister list help.
+# service register unregister list version help.
 # register: filesystem path. unregister: registered workspace canonical paths
 # from `nws list` when the daemon is reachable, plus native file completion as
 # fallback when it is not.
@@ -18,7 +18,7 @@ end
 
 # Token 1: subcommand names.
 complete -c nws -f -n "__fish_use_subcommand" \
-    -a "service register unregister list help"
+    -a "service register unregister list version help"
 
 # register: filesystem path, plus overlay flags when the word starts with "--".
 complete -c nws -f -n '__fish_seen_subcommand_from register; and string match -q -- "-*" (commandline -ct)' \

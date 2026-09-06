@@ -80,6 +80,7 @@ nws register [PATH]     add a workspace (default: current directory)
                         [--resolver SCRIPT] [--dev-shell-packages A,B,C]
 nws unregister [PATH]   remove a workspace
 nws list                list registered workspaces
+nws version             print the version (also --version, -v)
 nws help                show this help
 ```
 
@@ -583,7 +584,7 @@ nix profile install .#main
 
 What completes:
 
-- `nws <TAB>` — subcommands `service register unregister list help`.
+- `nws <TAB>` — subcommands `service register unregister list version help`.
 - `nws register <TAB>` — filesystem paths; `--<TAB>` offers the overlay flags
   (`--overlay`, `--attr-path`, `--overlay-attr`, `--no-flake`, `--nixpkgs`,
   `--resolver`).

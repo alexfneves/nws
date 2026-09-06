@@ -7,7 +7,7 @@
 
 _nws() {
     local -a cmds
-    cmds=(service register unregister list help)
+    cmds=(service register unregister list version help)
 
     if (( CURRENT == 2 )); then
         _describe 'command' cmds
@@ -31,7 +31,7 @@ _nws() {
                 _files   # fallback: filesystem when daemon unreachable
             fi
             ;;
-        *)  # service, list, help: no further tokens
+        *)  # service, list, version, help: no further tokens
             ;;
     esac
 }

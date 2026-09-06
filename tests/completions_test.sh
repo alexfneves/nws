@@ -30,7 +30,7 @@ cd "$work"
 if type compgen >/dev/null 2>&1; then  # bash w/ programmable completion
 printf '== bash ==\n'; source "$COMP/bash/nws"
 COMP_WORDS=(nws ""); COMP_CWORD=1; COMPREPLY=(); _nws
-for c in service register unregister list help; do
+for c in service register unregister list version help; do
   [[ " ${COMPREPLY[*]} " == *" $c "* ]] && ok "bash subcmd '$c'" || bad "bash subcmd '$c': ${COMPREPLY[*]}"
 done
 
@@ -48,7 +48,7 @@ unset MOCK_DAEMON_UP
 COMP_WORDS=(nws unregister ""); COMP_CWORD=2; COMPREPLY=(); _nws
 [[ " ${COMPREPLY[*]} " == *" alpha.txt "* ]] && ok "bash unregister fallback files" || bad "bash unregister fallback: ${COMPREPLY[*]}"
 
-for s in service list help; do
+for s in service list version help; do
   COMP_WORDS=(nws "$s" ""); COMP_CWORD=2; COMPREPLY=(); _nws
   [[ ${#COMPREPLY[@]} -eq 0 ]] && ok "bash $s no-token" || bad "bash $s no-token: ${COMPREPLY[*]}"
 done

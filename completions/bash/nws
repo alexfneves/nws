@@ -1,6 +1,6 @@
 # bash completion for nws
 # Installed to share/bash-completion/completions/nws
-# Tracks `nws help`'s subcommand list: service register unregister list help.
+# Tracks `nws help`'s subcommand list: service register unregister list version help.
 # register/unregister take an optional PATH; unregister also completes against
 # registered workspace canonical paths from `nws list` when the daemon is
 # reachable, falling back to filesystem completion otherwise.
@@ -12,7 +12,7 @@ _nws() {
 
     # First token: complete subcommand names.
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "service register unregister list help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "service register unregister list version help" -- "$cur") )
         return
     fi
 
@@ -33,7 +33,7 @@ _nws() {
                 COMPREPLY=( $(compgen -f -- "$cur") )
             fi
             ;;
-        *)  # service, list, help: no further tokens
+        *)  # service, list, version, help: no further tokens
             COMPREPLY=()
             ;;
     esac

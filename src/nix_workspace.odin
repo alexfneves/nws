@@ -80,6 +80,12 @@ WATCH_MASK :: linux.Inotify_Event_Mask {
 // CLI dispatch
 // ---------------------------------------------------------------------------
 
+// version returns the current nws version string ("major.minor.patch").
+// Bump here on release.
+version :: proc() -> string {
+	return "0.0.1"
+}
+
 main :: proc() {
 	args := os.args[1:]
 	if len(args) == 0 {
@@ -112,6 +118,8 @@ main :: proc() {
 		cmd_unregister(arg)
 	case "list":
 		cmd_list()
+	case "version", "--version", "-v":
+		cmd_version()
 	case "help", "--help", "-h":
 		print_usage()
 	case:
@@ -137,7 +145,13 @@ print_usage :: proc() {
 	)
 	fmt.println("  nws unregister [PATH]   remove a workspace")
 	fmt.println("  nws list                list registered workspaces")
+	fmt.println("  nws version             print the version (also --version, -v)")
 	fmt.println("  nws help                show this help")
+}
+
+// cmd_version prints the nws version ("nws <VERSION>").
+cmd_version :: proc() {
+	fmt.printf("nws %s\n", version())
 }
 
 // ---------------------------------------------------------------------------

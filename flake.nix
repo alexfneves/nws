@@ -58,6 +58,11 @@
         default = main;
       };
 
+      # NixOS and Home Manager modules: `services.nws.enable` installs nws and
+      # runs `nws service` as a systemd user unit. See nix/*.nix.
+      nixosModules.default = import ./nix/nixos.nix self;
+      homeManagerModules.default = import ./nix/home-manager.nix self;
+
       devShells.${system}.default = devenv.lib.mkShell {
         inherit inputs pkgs;
         modules = [

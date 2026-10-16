@@ -70,6 +70,30 @@ The unit runs `%h/.nix-profile/bin/nws service` and restarts on failure
 (`Restart=on-failure`). If you install `nws` somewhere else, edit the
 `ExecStart` line accordingly.
 
+### NixOS and Home Manager modules
+
+The flake also exposes `nixosModules.default` and
+`homeManagerModules.default`. Both install `nws` and run `nws service` as a
+systemd user unit that points at the store path, so the unit does not depend
+on `~/.nix-profile`:
+
+```nix
+# flake.nix of your system
+inputs.nws.url = "github:alexfneves/nws";
+
+# NixOS configuration
+imports = [ inputs.nws.nixosModules.default ];
+services.nws.enable = true;
+
+# or Home Manager configuration
+imports = [ inputs.nws.homeManagerModules.default ];
+services.nws.enable = true;
+```
+
+Both modules take an optional `services.nws.package` to override the build.
+The daemon still owns `~/.config/nws` (its `config.json` and `state.json`);
+the modules do not write those files.
+
 ## CLI usage
 
 ```

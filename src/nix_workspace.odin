@@ -22,6 +22,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sys/linux"
+import "core:sys/posix"
 import "nwscore:core"
 
 // ---------------------------------------------------------------------------
@@ -632,7 +633,7 @@ run_service :: proc(config_path_override: string = "") {
 stop_requested: bool
 stop_pipe: [2]linux.Fd = {-1, -1}
 
-on_stop_signal :: proc "c" (sig: linux.Signal) {
+on_stop_signal :: proc "c" (sig: posix.Signal) {
 	intrinsics.atomic_store(&stop_requested, true)
 	if stop_pipe[1] >= 0 {
 		b := [1]u8{1}
@@ -648,11 +649,13 @@ install_stop_handlers :: proc() {
 	if perr := linux.pipe2(&stop_pipe, {.NONBLOCK, .CLOEXEC}); perr != nil {
 		stop_pipe = {-1, -1} // EINTR on poll still ends the loop
 	}
-	for sig in ([]linux.Signal{.SIGTERM, .SIGINT}) {
-		sa := linux.Sig_Action {
-			handler = on_stop_signal,
-		}
-		linux.rt_sigaction(sig, &sa, nil)
+	for sig in ([]posix.Signal{.SIGTERM, .SIGINT}) {
+		// core:sys/posix is used because linux.Sig_Action is polymorphic in some Odin releases and
+		// plain in others, so no single declaration compiles with both (home-manager's nixpkgs
+		// ships the older one).
+		sa: posix.sigaction_t
+		sa.sa_handler = on_stop_signal
+		posix.sigaction(sig, &sa, nil)
 	}
 }
 

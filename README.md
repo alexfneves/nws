@@ -18,8 +18,8 @@ removed:
 - children's outputs (`packages`, `devShells`, `apps`, `checks`) are delegated
   under `<child>-` prefixed names, grouped per system.
 
-A tiny localhost TCP control socket lets the `register` / `unregister` / `list`
-client commands talk to the running daemon.
+A per-user Unix domain control socket lets the `register` / `unregister` /
+`list` client commands talk to the running daemon.
 
 ## Why
 
@@ -121,11 +121,21 @@ not edit` / `# /nws devShell block` markers inside your own devShell's `let`
 makes nws manage just that env binding instead.
 
 `register` / `unregister` / `list` are client commands: they connect to the
-daemon's control socket on the **default** port (`127.0.0.1:17424`), so the
-daemon must be running first. If you start the daemon with a custom
-`--config-path` that sets a different `port`, talk to it with
-`printf 'REGISTER <path>\n' | nc 127.0.0.1 <port>` (paths are
-percent-encoded on the wire).
+daemon's control socket (by default `$XDG_RUNTIME_DIR/nws/control.sock`; see
+[Configuration](#configuration)), so the daemon must be running first. When
+nothing listens there they print `nws: no daemon listening on <path>` and
+exit non-zero. The CLI reads `~/.config/nws/config.json`, not a daemon's
+`--config-path`, so if you start the daemon with a custom `--config-path`
+whose config sets a different `socket`, point the CLI at it with
+`NWS_SOCKET=<path> nws list`, or talk to it directly with
+`printf 'REGISTER <path>\n' | nc -U <path>` (paths are percent-encoded on the
+wire).
+
+The CLI and the daemon must come from the same build: the control channel
+moved from TCP (`127.0.0.1:17424`) to the Unix socket, so an old daemon and a
+new CLI (or the reverse) cannot reach each other. After upgrading nws, restart
+the daemon (`systemctl --user restart nws`, or stop and re-run
+`nws service`).
 
 Daemon logs (watch add/remove, flake generation, connection handling) go to
 stderr; set `NWS_LOG=0` to silence them.
@@ -284,15 +294,27 @@ back to defaults instead of crashing.
 
 ```json
 {
-  "port": 17424,
   "workspaces": [
     "/home/you/workspaces/mytree"
   ]
 }
 ```
 
-- `port` — TCP control-socket port (`127.0.0.1:<port>`). Default `17424`.
+- `socket` — optional control-socket path (absolute, at most 107 bytes). The
+  daemon and the CLI resolve the path the same way, first match wins:
+  1. the `NWS_SOCKET` environment variable, if set and non-empty;
+  2. the `socket` key;
+  3. `$XDG_RUNTIME_DIR/nws/control.sock`, if `XDG_RUNTIME_DIR` is set;
+  4. `/run/user/<uid>/nws/control.sock`.
+
+  The socket's parent directory must belong to you (see
+  [Control wire protocol](#control-wire-protocol)), so a path directly in a
+  shared directory such as `/tmp` is refused.
 - `workspaces` — canonical absolute workspace paths; duplicates rejected.
+- `port` — no longer used. Older configs that still carry it load fine; nws
+  prints `nws: config key "port" is no longer used; the control channel is a
+  Unix socket` to stderr, ignores the value, and drops the key the next time
+  the daemon rewrites the file.
 
 The file is written atomically; `register`/`unregister` update it
 automatically. Watches are re-established from the config on startup, so
@@ -355,7 +377,6 @@ Manual configuration remains possible with an object entry in `workspaces`
 
 ```json
 {
-  "port": 17424,
   "workspaces": [
     {
       "name": "/home/you/ros-ws",
@@ -567,9 +588,8 @@ Every `run.sh` follows the same contract:
   [Build & install](#build--install). There is no `result/`-binary lookup
   anywhere in the examples.
 
-- **Daemon policy.** Each script probes the daemon's control socket (a raw
-  `LIST` request must come back `OK <count>`; client exit codes can't be
-  trusted — they return 0 even against a dead daemon). If your `nws
+- **Daemon policy.** Each script probes the daemon's control socket with
+  `nws list` (it exits non-zero when nothing listens on the socket). If your `nws
   service` is already up, it is used as-is — never killed, never restarted.
   Otherwise the script spawns one for the run (detached in its own session,
   log at `/tmp/nws-example-<name>-daemon.log`) and stops **only that
@@ -618,9 +638,31 @@ What completes:
 
 ## Control wire protocol
 
-Raw newline-delimited TCP on `127.0.0.1:<port>` — no HTTP. One request line
-in, one reply line out (`OK`, `ERROR <msg>`, or `OK n` plus paths for
-`LIST`). Paths are percent-encoded so spaces and `%` round-trip safely.
+Raw newline-delimited text over a Unix stream socket at the resolved path
+(`$XDG_RUNTIME_DIR/nws/control.sock` by default; see
+[Configuration](#configuration)) — no HTTP. One request line in, one reply
+line out (`OK`, `ERROR <msg>`, or `OK n` plus paths for `LIST`); the daemon
+replies and closes. Paths are percent-encoded so spaces and `%` round-trip
+safely.
+
+Only the user running the daemon can talk to it. This matters because
+`REGISTER … resolver=<path>` names a program the daemon executes on every
+sync:
+
+- The socket's parent directory is `0700` and must be owned by the daemon's
+  user. The daemon creates it if missing, tightens it to `0700` if it is
+  yours, and refuses to start if it belongs to someone else or is not a
+  plain directory.
+- The socket itself is `0600`.
+- Every accepted connection's peer credentials are read with `SO_PEERCRED`.
+  A peer whose uid differs from the daemon's is logged and disconnected
+  before its request is read.
+
+A stale socket left by a killed daemon is detected (nothing accepts on it) and
+replaced on the next start. If another daemon is still listening, the new one
+prints `nws: another daemon is listening on <path>` and exits non-zero without
+touching it. A non-socket file at the path is never deleted. On `SIGTERM` or
+`SIGINT` the daemon removes its socket before exiting.
 
 `REGISTER` optionally takes a query-string suffix carrying backend options:
 
@@ -638,7 +680,7 @@ default flake backend. Malformed requests (bad escapes, unsupported backend,
 incomplete pairing) get an `ERROR` reply.
 
 ```
-$ printf 'LIST\n' | nc 127.0.0.1 17424
+$ printf 'LIST\n' | nc -U "$XDG_RUNTIME_DIR/nws/control.sock"
 OK 1
 /home/you/workspaces/mytree
 ```
@@ -696,6 +738,16 @@ Manual smoke test: `result/bin/nws service` in one shell, register a temp
 workspace with two cloned repos, and check that the generated root flake wires
 them locally while `git status` in both repos stays clean.
 
+Control-socket smoke test (starts and stops its own daemons against an
+isolated home and runtime dir; it refuses to run unless both are under
+`/tmp/nws-*`):
+
+```bash
+mkdir -m 0700 -p /tmp/nws-dev-home /tmp/nws-dev-run
+HOME=/tmp/nws-dev-home XDG_RUNTIME_DIR=/tmp/nws-dev-run \
+  NWS=$PWD/result/bin/nws bash tests/smoke_unix_socket.sh
+```
+
 ## Development workflow: `devenv up`
 
 Inside the dev shell you can run the daemon directly as a devenv process:
@@ -719,6 +771,9 @@ Stop with `Ctrl-C`.
   - `git_remote.odin` — fail-open `.git/config` origin parser.
   - `state.odin` — atomic canonical-URL state (`state.json`).
   - `config.odin` — config load/save.
+  - `control_socket.odin` — control-socket path resolution (`NWS_SOCKET`,
+    config `socket`, `XDG_RUNTIME_DIR`, `/run/user/<uid>`), length limit and
+    socket-directory policy.
   - `scan_children.odin` — recursive overlay child scanner (flattening seam
     injected, pure).
   - `resolver.odin` — external resolver `NAME\tRELPATH` line parser and

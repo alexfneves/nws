@@ -34,6 +34,8 @@
           Type=simple
           ExecStart=%h/.nix-profile/bin/nws service
           Restart=on-failure
+          RuntimeDirectory=nws
+          RuntimeDirectoryMode=0700
           [Install]
           WantedBy=default.target
           EOF

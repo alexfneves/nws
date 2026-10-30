@@ -5,9 +5,10 @@
 #   imports = [ inputs.nws.nixosModules.default ];
 #   services.nws.enable = true;
 #
-# nws is a per-user daemon: it watches the workspaces of the user who runs it
-# and keeps its state under ~/.config/nws. So this runs it as a systemd *user*
-# unit for every user session, not as a system service.
+# nws is a per-user daemon: it watches the workspaces of the user who runs it,
+# keeps its state under ~/.config/nws and serves its control socket at
+# $XDG_RUNTIME_DIR/nws/control.sock. So this runs it as a systemd *user* unit
+# for every user session, not as a system service.
 self:
 { config, lib, pkgs, ... }:
 let
@@ -30,6 +31,8 @@ in
 
     # ExecStart uses the store path directly, so the unit does not depend on
     # the user's profile layout (the upstream unit assumes ~/.nix-profile).
+    # RuntimeDirectory creates $XDG_RUNTIME_DIR/nws (mode 0700) for the
+    # control socket and removes it when the service stops.
     systemd.user.services.nws = {
       description = "Nix Workspace daemon";
       wantedBy = [ "default.target" ];
@@ -37,6 +40,8 @@ in
         Type = "simple";
         ExecStart = "${cfg.package}/bin/nws service";
         Restart = "on-failure";
+        RuntimeDirectory = "nws";
+        RuntimeDirectoryMode = "0700";
       };
     };
   };

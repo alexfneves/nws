@@ -6,7 +6,8 @@
 #   services.nws.enable = true;
 #
 # Installs nws into the user's profile and runs `nws service` as a systemd user
-# unit. The daemon writes its state under ~/.config/nws.
+# unit. The daemon writes its state under ~/.config/nws and serves its control
+# socket at $XDG_RUNTIME_DIR/nws/control.sock.
 self:
 { config, lib, pkgs, ... }:
 let
@@ -31,12 +32,16 @@ in
 
     # ExecStart uses the store path directly, so the unit does not depend on
     # ~/.nix-profile existing (the upstream unit assumes it does).
+    # RuntimeDirectory creates $XDG_RUNTIME_DIR/nws (mode 0700) for the
+    # control socket and removes it when the service stops.
     systemd.user.services.nws = {
       Unit.Description = "Nix Workspace daemon";
       Service = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/nws service";
         Restart = "on-failure";
+        RuntimeDirectory = "nws";
+        RuntimeDirectoryMode = "0700";
       };
       Install.WantedBy = [ "default.target" ];
     };

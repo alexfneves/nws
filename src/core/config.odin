@@ -38,22 +38,25 @@ Workspace_Config :: struct {
 
 // Config holds the persisted daemon settings.
 Config :: struct {
-	port:       int,
-	workspaces: [dynamic]Workspace_Config,
+	// socket overrides the control-socket path ("" = resolve the default; see
+	// control_socket_path). NWS_SOCKET in the environment takes precedence.
+	socket:      string,
+	// legacy_port is set when the file still carries the obsolete TCP "port"
+	// key. The value is ignored and never written back; callers warn once
+	// (see LEGACY_PORT_WARNING).
+	legacy_port: bool,
+	workspaces:  [dynamic]Workspace_Config,
 }
 
-// DEFAULT_PORT is the TCP control-socket port used when config.json has no
-// "port" key (or no config file exists).
-DEFAULT_PORT :: 17424
+// LEGACY_PORT_WARNING is printed to stderr when config.json has a "port" key.
+LEGACY_PORT_WARNING :: "nws: config key \"port\" is no longer used; the control channel is a Unix socket"
 
 // load_config reads and parses config.json. Missing keys fall back to
 // defaults and a missing/corrupt file returns defaults rather than crashing.
-// The second return reports whether a valid "port"/"workspaces" object was
-// actually parsed from the file.
+// The second return reports whether a valid config object was actually
+// parsed from the file.
 load_config :: proc(path: string, allocator := context.allocator) -> (Config, bool) {
-	cfg := Config {
-		port = DEFAULT_PORT,
-	}
+	cfg: Config
 	cfg.workspaces = make([dynamic]Workspace_Config, allocator)
 
 	data, rerr := os.read_entire_file(path, allocator)
@@ -73,12 +76,16 @@ load_config :: proc(path: string, allocator := context.allocator) -> (Config, bo
 		return cfg, false
 	}
 
-	if port_v, has := obj["port"]; has {
-		#partial switch p in port_v {
-		case json.Integer:
-			cfg.port = int(p)
-		case json.Float:
-			cfg.port = int(p)
+	if _, has := obj["port"]; has {
+		cfg.legacy_port = true
+	}
+
+	if sock_v, has := obj["socket"]; has {
+		#partial switch s in sock_v {
+		case json.String:
+			if len(s) > 0 {
+				cfg.socket = strings.clone(s, allocator)
+			}
 		}
 	}
 
@@ -253,7 +260,12 @@ build_config_json :: proc(cfg: Config, allocator := context.allocator) -> string
 	defer strings.builder_destroy(&b)
 
 	strings.write_string(&b, "{\n")
-	strings.write_string(&b, fmt.tprintf("  \"port\": %d,\n", cfg.port))
+	if len(cfg.socket) > 0 {
+		strings.write_string(
+			&b,
+			fmt.tprintf("  \"socket\": \"%s\",\n", json_escape(cfg.socket, allocator)),
+		)
+	}
 	strings.write_string(&b, "  \"workspaces\": [")
 	for ws, i in cfg.workspaces {
 		if i > 0 {
@@ -377,6 +389,15 @@ clone_workspace_config :: proc(
 		}
 	}
 	return out
+}
+
+// delete_config frees everything load_config allocated: the socket override
+// and every workspace.
+delete_config :: proc(cfg: ^Config) {
+	if len(cfg.socket) > 0 {
+		delete(cfg.socket)
+	}
+	delete_workspaces(cfg)
 }
 
 // delete_workspaces frees every workspace (names, overlay entries, URLs) and

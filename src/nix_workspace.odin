@@ -4,17 +4,20 @@ package main
 //
 // A single binary with a long-running daemon mode (`nws service`) and three
 // client commands (`register`/`unregister`/`list`) that talk to the daemon
-// over a localhost TCP control socket.
+// over a per-user Unix domain control socket.
 //
 // The daemon watches a set of Nix "workspace" folders with inotify, and when a
 // repo subfolder appears or disappears it rewrites that workspace's
 // `flake.nix` so cloned repos are pinned to `path:./<name>` and uncloned ones
 // keep (or return to) their canonical GitHub URL. It serves the control socket
-// on 127.0.0.1:<port> using a single-threaded, poll-multiplexed event loop.
+// (core.control_socket_path, default $XDG_RUNTIME_DIR/nws/control.sock) using
+// a single-threaded, poll-multiplexed event loop. The socket lives in a 0700
+// directory, is itself 0600, and every peer's uid is checked (SO_PEERCRED)
+// before its request is read: REGISTER can name a resolver the daemon runs.
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
-import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -33,10 +36,9 @@ Workspace :: struct {
 }
 
 // Client is one accepted control-socket connection. Buffering is per-fd so a
-// command that arrives in multiple TCP chunks is only dispatched once a full
+// command that arrives in multiple chunks is only dispatched once a full
 // '\n' is present.
 Client :: struct {
-	sock:    net.TCP_Socket,
 	fd:      linux.Fd,
 	buf:     [dynamic]u8,
 	revents: linux.Fd_Poll_Events,
@@ -46,7 +48,12 @@ Client :: struct {
 
 Daemon_State :: struct {
 	inotify_fd:  linux.Fd,
-	listen_sock: net.TCP_Socket,
+	listen_fd:   linux.Fd,
+	// socket_path is the bound control socket; socket_ino identifies the
+	// socket file we created so shutdown never unlinks a successor's socket.
+	socket_path: string,
+	socket_ino:  linux.Inode,
+	uid:         linux.Uid,
 	ws:          [dynamic]Workspace,
 	// ws_cfgs holds the full per-workspace backend settings (overlay entries,
 	// nixpkgs URL) keyed by canonical workspace path. Only overlay workspaces
@@ -54,7 +61,9 @@ Daemon_State :: struct {
 	ws_cfgs:     map[string]core.Workspace_Config,
 	clients:     [dynamic]Client,
 	config_path: string,
-	port:        int,
+	// cfg_socket is config.json's "socket" value, written back unchanged by
+	// save_state_config.
+	cfg_socket:  string,
 	logging:     bool,
 }
 
@@ -203,48 +212,87 @@ resolve_path :: proc(arg: string) -> string {
 // Client commands (register / unregister / list)
 // ---------------------------------------------------------------------------
 
-client_port :: proc() -> int {
+// client_socket_path resolves the daemon's control socket exactly as the
+// daemon does (core.control_socket_path: NWS_SOCKET, config "socket", the
+// XDG_RUNTIME_DIR default). An unusable path is fatal.
+client_socket_path :: proc() -> string {
 	cfg, _ := core.load_config(config_path())
-	defer core.delete_workspaces(&cfg)
-	return cfg.port
+	defer core.delete_config(&cfg)
+	if cfg.legacy_port {
+		fmt.eprintln(core.LEGACY_PORT_WARNING)
+	}
+	path := core.control_socket_path(cfg.socket)
+	if msg := core.socket_path_error(path); msg != "" {
+		fmt.eprintf("nws: %s\n", msg)
+		os.exit(1)
+	}
+	return path
 }
 
-// tcp_request sends one line to the daemon and reads the full reply, following
-// the connection-per-request protocol: the daemon replies then closes, so we
-// read until EOF.
-tcp_request :: proc(port: int, line: string) -> (ok: bool, data: string) {
-	ep_str := strings.concatenate({"127.0.0.1:", fmt.tprintf("%d", port)}, context.allocator)
-	ep, eok := net.parse_endpoint(ep_str)
-	delete(ep_str)
-	if !eok {
-		return false, ""
+// unix_addr builds the sockaddr_un for a path already validated by
+// core.socket_path_error, so it always fits together with its NUL.
+unix_addr :: proc(path: string) -> linux.Sock_Addr_Un {
+	addr := linux.Sock_Addr_Un {
+		sun_family = .UNIX,
 	}
-	sock, derr := net.dial_tcp(ep)
-	if derr != nil {
-		return false, ""
-	}
-	defer net.close(sock)
+	copy(addr.sun_path[:len(addr.sun_path) - 1], path)
+	return addr
+}
 
-	_, _ = net.send_tcp(sock, transmute([]byte)line)
+// unix_request sends one line to the daemon and reads the full reply,
+// following the connection-per-request protocol: the daemon replies then
+// closes, so we read until EOF. Any failure is printed and exits non-zero.
+unix_request :: proc(path, line: string) -> string {
+	fd, serr := linux.socket(.UNIX, .STREAM, {.CLOEXEC}, linux.Protocol(0))
+	if serr != nil {
+		fmt.eprintln("nws: socket failed:", serr)
+		os.exit(1)
+	}
+	defer linux.close(fd)
+
+	addr := unix_addr(path)
+	if cerr := linux.connect(fd, &addr); cerr != nil {
+		if cerr == .ENOENT || cerr == .ECONNREFUSED {
+			fmt.eprintf("nws: no daemon listening on %s (start one with: nws service)\n", path)
+		} else {
+			fmt.eprintf("nws: cannot connect to %s: %v\n", path, cerr)
+		}
+		os.exit(1)
+	}
+
+	// MSG_NOSIGNAL: a daemon that hangs up early must surface as EPIPE, not
+	// kill the client with SIGPIPE.
+	out := transmute([]u8)line
+	for len(out) > 0 {
+		n, werr := linux.send(fd, out, {.NOSIGNAL})
+		if werr == .EINTR {
+			continue
+		}
+		if werr != nil || n <= 0 {
+			break // read whatever the daemon managed to answer
+		}
+		out = out[n:]
+	}
 
 	b := strings.builder_make(context.allocator)
 	defer strings.builder_destroy(&b)
 	buf: [4096]u8
 	for {
-		n, rerr := net.recv_tcp(sock, buf[:])
-		if n <= 0 {
+		n, rerr := linux.recv(fd, buf[:], {})
+		if rerr == .EINTR {
+			continue
+		}
+		if rerr != nil || n <= 0 {
 			break
 		}
 		strings.write_bytes(&b, buf[:n])
-		if rerr != nil {
-			break
-		}
 	}
 
 	if strings.builder_len(b) == 0 {
-		return false, ""
+		fmt.eprintf("nws: daemon on %s closed the connection without replying\n", path)
+		os.exit(1)
 	}
-	return true, strings.clone(strings.to_string(b), context.allocator)
+	return strings.clone(strings.to_string(b), context.allocator)
 }
 
 // register_options holds the parsed CLI flags of `nws register`.
@@ -271,7 +319,8 @@ cmd_register :: proc(argv: []string) {
 		delete(opts.dev_shell_packages)
 	}
 
-	port := client_port()
+	sock_path := client_socket_path()
+	defer delete(sock_path)
 	path := resolve_path(opts.path)
 	defer delete(path)
 
@@ -293,11 +342,7 @@ cmd_register :: proc(argv: []string) {
 	line := strings.concatenate({"REGISTER ", enc, "\n"}, context.allocator)
 	defer delete(line)
 
-	sent, reply := tcp_request(port, line)
-	if !sent {
-		fmt.println("nws: cannot reach daemon on 127.0.0.1:", port, "- is the daemon running?")
-		return
-	}
+	reply := unix_request(sock_path, line)
 	defer delete(reply)
 	fmt.println(strings.trim_space(reply))
 }
@@ -414,32 +459,26 @@ parse_register_flags :: proc(argv: []string) -> (opts: Register_Options, ok: boo
 }
 
 cmd_unregister :: proc(arg: string) {
-	port := client_port()
+	sock_path := client_socket_path()
 	path := resolve_path(arg)
 	enc := core.encode(path)
 	defer {
 		delete(enc)
 		delete(path)
+		delete(sock_path)
 	}
 	line := strings.concatenate({"UNREGISTER ", enc, "\n"}, context.allocator)
 	defer delete(line)
 
-	ok, reply := tcp_request(port, line)
-	if !ok {
-		fmt.println("nws: cannot reach daemon on 127.0.0.1:", port, "- is the daemon running?")
-		return
-	}
+	reply := unix_request(sock_path, line)
 	defer delete(reply)
 	fmt.println(strings.trim_space(reply))
 }
 
 cmd_list :: proc() {
-	port := client_port()
-	ok, data := tcp_request(port, "LIST\n")
-	if !ok {
-		fmt.println("nws: cannot reach daemon on 127.0.0.1:", port, "- is the daemon running?")
-		return
-	}
+	sock_path := client_socket_path()
+	defer delete(sock_path)
+	data := unix_request(sock_path, "LIST\n")
 	defer delete(data)
 
 	s := strings.trim_space(data)
@@ -499,12 +538,22 @@ run_service :: proc(config_path_override: string = "") {
 		return
 	}
 	cfg, _ := core.load_config(cfg_path)
-	log_line(logging, "daemon starting on 127.0.0.1:%d", cfg.port)
+	if cfg.legacy_port {
+		fmt.eprintln(core.LEGACY_PORT_WARNING)
+	}
+	sock_path := core.control_socket_path(cfg.socket)
+	if msg := core.socket_path_error(sock_path); msg != "" {
+		fmt.eprintf("nws: %s\n", msg)
+		os.exit(1)
+	}
+	log_line(logging, "daemon starting (control socket %s)", sock_path)
 
 	state := Daemon_State{}
 	state.ws_cfgs = make(map[string]core.Workspace_Config)
 	state.config_path = cfg_path
-	state.port = cfg.port
+	state.cfg_socket = cfg.socket != "" ? strings.clone(cfg.socket) : ""
+	state.socket_path = sock_path
+	state.uid = linux.getuid()
 	state.logging = logging
 
 	// inotify
@@ -515,24 +564,13 @@ run_service :: proc(config_path_override: string = "") {
 	}
 	state.inotify_fd = fd
 
-	// control listen socket
-	ep_str := strings.concatenate({"127.0.0.1:", fmt.tprintf("%d", cfg.port)}, context.allocator)
-	ep, eok := net.parse_endpoint(ep_str)
-	delete(ep_str)
-	if !eok {
-		fmt.eprintln("nws: bad listen endpoint 127.0.0.1:", cfg.port)
-		return
+	// control listen socket — before any workspace is loaded, so a second
+	// daemon bails out without touching config or flakes.
+	if !listen_control_socket(&state) {
+		os.exit(1)
 	}
-	sock, lerr := net.listen_tcp(ep)
-	if lerr != nil {
-		fmt.eprintln("nws: listen_tcp failed:", lerr)
-		return
-	}
-	if eb := net.set_blocking(sock, false); eb != nil {
-		fmt.eprintln("nws: set_blocking(listen) failed:", eb)
-	}
-	state.listen_sock = sock
-	log_line(logging, "listening on 127.0.0.1:%d", cfg.port)
+	log_line(logging, "listening on %s", sock_path)
+	install_stop_handlers()
 
 	// Keep overlay workspaces' backend settings so save_state_config can
 	// round-trip them instead of degrading to the legacy string form.
@@ -557,11 +595,13 @@ run_service :: proc(config_path_override: string = "") {
 			log_line(logging, "warning: cannot watch %q — skipping", ws.name)
 		}
 	}
-	core.delete_workspaces(&cfg)
+	core.delete_config(&cfg)
 	log_line(logging, "%d workspace(s) loaded", len(state.ws))
 
-	// Main event loop: inotify fd, listen fd, then one poll entry per client.
-	for {
+	// Main event loop: inotify fd, listen fd, stop pipe, then one poll entry
+	// per client. SIGTERM/SIGINT wake poll through the stop pipe (or EINTR)
+	// and end the loop.
+	for !intrinsics.atomic_load(&stop_requested) {
 		poll_fds := build_poll(&state)
 		n, perr := linux.poll(poll_fds[:], -1)
 		if perr != nil || n <= 0 {
@@ -569,7 +609,7 @@ run_service :: proc(config_path_override: string = "") {
 			continue
 		}
 		for i in 0 ..< len(state.clients) {
-			state.clients[i].revents = poll_fds[2 + i].revents
+			state.clients[i].revents = poll_fds[3 + i].revents
 		}
 		if len(poll_fds) > 0 && poll_fds[0].revents != {} {
 			drain_inotify(&state, logging)
@@ -580,36 +620,234 @@ run_service :: proc(config_path_override: string = "") {
 		service_clients(&state, logging)
 		delete(poll_fds)
 	}
+
+	log_line(logging, "stopping")
+	close_control_socket(&state)
+}
+
+// stop_requested is set by the SIGTERM/SIGINT handler and checked by the
+// event loop, which then removes the socket and returns. The handler also
+// writes a byte to stop_pipe, which sits in the poll set, so a signal that
+// lands between the loop check and poll() still wakes the loop.
+stop_requested: bool
+stop_pipe: [2]linux.Fd = {-1, -1}
+
+on_stop_signal :: proc "c" (sig: linux.Signal) {
+	intrinsics.atomic_store(&stop_requested, true)
+	if stop_pipe[1] >= 0 {
+		b := [1]u8{1}
+		linux.write(stop_pipe[1], b[:])
+	}
+}
+
+// install_stop_handlers routes SIGTERM/SIGINT to on_stop_signal so the daemon
+// can unlink its socket on the way out. A caught (not ignored) handler resets
+// to the default in exec'd resolver children. SIGPIPE stays default: every
+// send uses MSG_NOSIGNAL instead.
+install_stop_handlers :: proc() {
+	if perr := linux.pipe2(&stop_pipe, {.NONBLOCK, .CLOEXEC}); perr != nil {
+		stop_pipe = {-1, -1} // EINTR on poll still ends the loop
+	}
+	for sig in ([]linux.Signal{.SIGTERM, .SIGINT}) {
+		sa := linux.Sig_Action {
+			handler = on_stop_signal,
+		}
+		linux.rt_sigaction(sig, &sa, nil)
+	}
+}
+
+// ensure_socket_dir creates the socket's parent directory with mode 0700, or
+// checks an existing one: it must be a real directory (lstat — no symlinks)
+// owned by us; a wrong mode on our own directory is fixed to 0700.
+ensure_socket_dir :: proc(dir: string, uid: linux.Uid, logging: bool) -> bool {
+	dir := dir
+	if dir == "" {
+		dir = "/"
+	}
+	cdir := strings.clone_to_cstring(dir, context.temp_allocator)
+	if merr := linux.mkdir(cdir, {.IRUSR, .IWUSR, .IXUSR}); merr != nil && merr != .EEXIST {
+		fmt.eprintf("nws: cannot create socket directory %s: %v\n", dir, merr)
+		return false
+	}
+	st: linux.Stat
+	if serr := linux.lstat(cdir, &st); serr != nil {
+		fmt.eprintf("nws: cannot stat socket directory %s: %v\n", dir, serr)
+		return false
+	}
+	perm := transmute(u32)st.mode & 0o7777
+	switch core.socket_dir_verdict(linux.S_ISDIR(st.mode), u32(st.uid), u32(uid), perm) {
+	case .Ok:
+	case .Fix_Mode:
+		if cerr := linux.chmod(cdir, {.IRUSR, .IWUSR, .IXUSR}); cerr != nil {
+			fmt.eprintf("nws: cannot chmod socket directory %s to 0700: %v\n", dir, cerr)
+			return false
+		}
+		log_line(logging, "socket directory %s had mode %o — set to 0700", dir, perm)
+	case .Not_Dir:
+		fmt.eprintf("nws: socket directory %s is not a directory\n", dir)
+		return false
+	case .Wrong_Owner:
+		fmt.eprintf("nws: socket directory %s is owned by uid %d, not %d\n", dir, st.uid, uid)
+		return false
+	}
+	return true
+}
+
+// listen_control_socket prepares the socket directory, clears a stale socket
+// left by a dead daemon, then binds and listens on state.socket_path (mode
+// 0600). It never unlinks a non-socket file or a live daemon's socket; on any
+// failure it prints the reason and returns false.
+listen_control_socket :: proc(state: ^Daemon_State) -> bool {
+	path := state.socket_path
+	if !ensure_socket_dir(core.parent_dir(path), state.uid, state.logging) {
+		return false
+	}
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	addr := unix_addr(path)
+
+	st: linux.Stat
+	if lerr := linux.lstat(cpath, &st); lerr == nil {
+		if !linux.S_ISSOCK(st.mode) {
+			fmt.eprintf("nws: %s exists and is not a socket — not replacing it\n", path)
+			return false
+		}
+		// Probe it: a live daemon accepts (or is merely backlogged); a dead
+		// one leaves a socket nobody listens on.
+		probe, perr := linux.socket(.UNIX, .STREAM, {.NONBLOCK, .CLOEXEC}, linux.Protocol(0))
+		if perr != nil {
+			fmt.eprintln("nws: socket failed:", perr)
+			return false
+		}
+		cerr := linux.connect(probe, &addr)
+		linux.close(probe)
+		if cerr == .NONE || cerr == .EAGAIN {
+			fmt.eprintf("nws: another daemon is listening on %s\n", path)
+			return false
+		} else if cerr == .ECONNREFUSED || cerr == .ENOENT {
+			log_line(state.logging, "removing stale socket %s", path)
+			if uerr := linux.unlink(cpath); uerr != nil && uerr != .ENOENT {
+				fmt.eprintf("nws: cannot remove stale socket %s: %v\n", path, uerr)
+				return false
+			}
+		} else {
+			fmt.eprintf("nws: cannot probe existing socket %s: %v\n", path, cerr)
+			return false
+		}
+	} else if lerr != .ENOENT {
+		fmt.eprintf("nws: cannot stat %s: %v\n", path, lerr)
+		return false
+	}
+
+	fd, serr := linux.socket(.UNIX, .STREAM, {.NONBLOCK, .CLOEXEC}, linux.Protocol(0))
+	if serr != nil {
+		fmt.eprintln("nws: socket failed:", serr)
+		return false
+	}
+	if berr := linux.bind(fd, &addr); berr != nil {
+		fmt.eprintf("nws: cannot bind %s: %v\n", path, berr)
+		linux.close(fd)
+		return false
+	}
+	// The 0700 directory already keeps other users out; 0600 on the socket
+	// itself holds even if the directory is later loosened.
+	if cerr := linux.chmod(cpath, {.IRUSR, .IWUSR}); cerr != nil {
+		fmt.eprintf("nws: cannot chmod %s to 0600: %v\n", path, cerr)
+		linux.close(fd)
+		linux.unlink(cpath)
+		return false
+	}
+	if lerr := linux.listen(fd, 16); lerr != nil {
+		fmt.eprintf("nws: cannot listen on %s: %v\n", path, lerr)
+		linux.close(fd)
+		linux.unlink(cpath)
+		return false
+	}
+	if serr := linux.lstat(cpath, &st); serr == nil {
+		state.socket_ino = st.ino
+	}
+	state.listen_fd = fd
+	return true
+}
+
+// close_control_socket closes every client and the listen socket, then
+// unlinks the socket file — best effort, and only if it is still the one we
+// bound (a successor daemon may already own the path).
+close_control_socket :: proc(state: ^Daemon_State) {
+	for len(state.clients) > 0 {
+		close_client(state, len(state.clients) - 1)
+	}
+	linux.close(state.listen_fd)
+	cpath := strings.clone_to_cstring(state.socket_path, context.temp_allocator)
+	st: linux.Stat
+	if linux.lstat(cpath, &st) == nil && linux.S_ISSOCK(st.mode) && st.ino == state.socket_ino {
+		linux.unlink(cpath)
+	}
 }
 
 build_poll :: proc(state: ^Daemon_State) -> [dynamic]linux.Poll_Fd {
 	fds := make([dynamic]linux.Poll_Fd)
 	append(&fds, linux.Poll_Fd{fd = state.inotify_fd, events = {.IN}})
-	append(&fds, linux.Poll_Fd{fd = tcp_fd(state.listen_sock), events = {.IN}})
+	append(&fds, linux.Poll_Fd{fd = state.listen_fd, events = {.IN}})
+	append(&fds, linux.Poll_Fd{fd = stop_pipe[0], events = {.IN}}) // fd -1 is skipped
 	for c in state.clients {
 		append(&fds, linux.Poll_Fd{fd = c.fd, events = {.IN}})
 	}
 	return fds
 }
 
-// tcp_fd unwraps a TCP_Socket (distinct Socket :: distinct i64) to the 32-bit
-// linux.Fd used for poll. Real fds fit in 32 bits, so the truncating cast is
-// safe.
-tcp_fd :: proc(sock: net.TCP_Socket) -> linux.Fd {
-	return linux.Fd(transmute(i64)sock)
+// Ucred mirrors the kernel's struct ucred filled in by SO_PEERCRED.
+Ucred :: struct {
+	pid: linux.Pid,
+	uid: linux.Uid,
+	gid: linux.Gid,
+}
+
+// peer_cred reads the connecting process's credentials. The raw syscall is
+// used because linux.getsockopt cannot take a struct out-parameter.
+peer_cred :: proc(fd: linux.Fd) -> (cred: Ucred, ok: bool) {
+	size := u32(size_of(Ucred))
+	ret := intrinsics.syscall(
+		linux.SYS_getsockopt,
+		uintptr(fd),
+		uintptr(linux.SOL_SOCKET),
+		uintptr(linux.Socket_Option.PEERCRED),
+		uintptr(&cred),
+		uintptr(&size),
+	)
+	return cred, int(ret) == 0 && size == size_of(Ucred)
 }
 
 accept_clients :: proc(state: ^Daemon_State, logging: bool) {
 	for {
-		client, _, aerr := net.accept_tcp(state.listen_sock)
+		addr: linux.Sock_Addr_Un
+		fd, aerr := linux.accept(state.listen_fd, &addr, {.NONBLOCK, .CLOEXEC})
+		if aerr == .EINTR {
+			continue
+		}
 		if aerr != nil {
 			break // would-block (non-blocking listen) — no more pending
 		}
-		if eb := net.set_blocking(client, false); eb != nil {
-			log_line(logging, "set_blocking(client) failed: %v", eb)
+		// Only our own uid may talk to us: REGISTER can name a resolver the
+		// daemon executes. Reject before reading a single byte.
+		cred, ok := peer_cred(fd)
+		if !ok || cred.uid != state.uid {
+			if ok {
+				log_line(
+					logging,
+					"rejected client (fd %d): peer uid %d pid %d is not uid %d",
+					fd,
+					cred.uid,
+					cred.pid,
+					state.uid,
+				)
+			} else {
+				log_line(logging, "rejected client (fd %d): SO_PEERCRED failed", fd)
+			}
+			linux.close(fd)
+			continue
 		}
-		append(&state.clients, Client{sock = client, fd = tcp_fd(client), buf = make([dynamic]u8)})
-		log_line(logging, "client connected (fd %d)", tcp_fd(client))
+		append(&state.clients, Client{fd = fd, buf = make([dynamic]u8)})
+		log_line(logging, "client connected (fd %d, pid %d)", fd, cred.pid)
 	}
 }
 
@@ -623,14 +861,17 @@ service_clients :: proc(state: ^Daemon_State, logging: bool) {
 		if .IN in c.revents || c.closed {
 			buf: [4096]u8
 			for {
-				n, rerr := net.recv_tcp(c.sock, buf[:])
-				if n > 0 {
+				n, rerr := linux.recv(c.fd, buf[:], {})
+				if rerr == nil && n > 0 {
 					append(&c.buf, ..buf[:n])
 					continue
 				}
-				// n == 0 here: keep the client on Would_Block (more data may
-				// come on a later poll pass); close only on real EOF or error.
-				if rerr == .Would_Block {
+				if rerr == .EINTR {
+					continue
+				}
+				// Keep the client on EAGAIN (more data may come on a later
+				// poll pass); close only on real EOF or error.
+				if rerr == .EAGAIN {
 					break
 				}
 				c.closed = true // graceful EOF (0, nil) or a real error
@@ -642,7 +883,7 @@ service_clients :: proc(state: ^Daemon_State, logging: bool) {
 		if nl := strings.index_byte(data, '\n'); nl >= 0 {
 			line := strings.trim_space(data[:nl])
 			reply := route_command(state, line)
-			net.send_tcp(c.sock, transmute([]byte)reply)
+			send_reply(c.fd, reply)
 			delete(reply)
 			log_line(logging, "served %q", line)
 			c.served = true
@@ -657,9 +898,26 @@ service_clients :: proc(state: ^Daemon_State, logging: bool) {
 	}
 }
 
+// send_reply writes the whole reply to a client. MSG_NOSIGNAL keeps a client
+// that already hung up from killing the daemon with SIGPIPE; the socket is
+// non-blocking, so a reader that stops reading only loses its own reply.
+send_reply :: proc(fd: linux.Fd, reply: string) {
+	out := transmute([]u8)reply
+	for len(out) > 0 {
+		n, werr := linux.send(fd, out, {.NOSIGNAL})
+		if werr == .EINTR {
+			continue
+		}
+		if werr != nil || n <= 0 {
+			return
+		}
+		out = out[n:]
+	}
+}
+
 close_client :: proc(state: ^Daemon_State, idx: int) {
 	c := &state.clients[idx]
-	net.close(c.sock)
+	linux.close(c.fd)
 	delete(c.buf)
 	unordered_remove(&state.clients, idx)
 }
@@ -877,7 +1135,7 @@ forget_workspace_config :: proc(state: ^Daemon_State, path: string) {
 
 save_state_config :: proc(state: ^Daemon_State) {
 	cfg := core.Config {
-		port = state.port,
+		socket = state.cfg_socket, // borrowed: only delete_workspaces runs below
 	}
 	cfg.workspaces = make([dynamic]core.Workspace_Config, context.allocator)
 	defer core.delete_workspaces(&cfg)

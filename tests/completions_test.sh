@@ -17,7 +17,8 @@ case "$1" in
     if [[ -n "${MOCK_DAEMON_UP:-}" ]]; then
       printf 'OK 2\n/home/user/a repo\n/home/user/other\n'
     else
-      printf 'nws: cannot reach daemon on 127.0.0.1:17424 - is the daemon running?\n'
+      printf 'nws: no daemon listening on /run/user/1000/nws/control.sock (start one with: nws service)\n' >&2
+      exit 1
     fi ;;
   *) exit 0 ;;
 esac

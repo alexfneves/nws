@@ -9,20 +9,18 @@
 #     resolver is copied here, and this folder is registered. The script
 #     refuses to run from the nws repo root (AGENTS.md + examples/ present)
 #     so the repo's own flake.nix can never be clobbered by an accident.
-#   * Daemon policy: probe liveness on the WIRE — a live daemon answers a
-#     raw `LIST` request with `OK <count>...` (list_reply). The probe reads
-#     that reply directly: every nws client command exits 0 even against a
-#     dead daemon (it prints an error and returns), AND `nws list`'s client
-#     strips the OK header and prints only the workspace paths — so neither
-#     the exit code nor the client's stdout can signal reachability. If a
+#   * Daemon policy: probe liveness with the nws CLI itself — `nws list`
+#     exits non-zero when nothing listens on the control socket (a Unix
+#     socket, which bash cannot open, so there is no raw wire probe). The
+#     socket path is resolved like the daemon does it (_nws_socket). If a
 #     daemon is reachable it is USED — never killed, never restarted.
 #     Otherwise one is spawned (`setsid nws service > /tmp/nws-example-<name>-
 #     daemon.log 2>&1 &`) — detached into its OWN SESSION, so a terminal
-#     Ctrl+C to the script never reaches it (nws service has no signal
-#     handler; left in the script's group it would die with it). The spawn
-#     is confirmed LIVE before use: if it never answers LIST with OK the
-#     script FAILS HARD with the log path (port already taken by another
-#     process / crash at startup must be an error, never a silent continue),
+#     Ctrl+C to the script never reaches it (nws service stops on SIGINT;
+#     left in the script's group it would stop with it). The spawn is
+#     confirmed LIVE before use: if `nws list` never succeeds against it the
+#     script FAILS HARD with the log path (another daemon on the socket /
+#     crash at startup must be an error, never a silent continue),
 #     and a spawned daemon that exits immediately is caught right away.
 #     An EXIT/INT/TERM trap kills ONLY the spawned PID (kill -0-guarded,
 #     then wait) — never process-kills anything it did not start; passing
@@ -32,7 +30,7 @@
 #     first): `nws list | grep -qxF "$PWD"` skips a previous registration; a
 #     reply containing `ERROR already registered` (a race) counts as success;
 #     a daemon that is not reachable at registration time — or a register
-#     reply carrying `cannot reach daemon` — is a HARD error. NEVER
+#     reply carrying `no daemon listening` — is a HARD error. NEVER
 #     de-register, never delete folders.
 #
 # Sourced by each example's run.sh; set EXAMPLE_NAME first (used for the
@@ -105,52 +103,47 @@ _exit_from_signal() {
   exit 130
 }
 
-# _nws_port prints the control-socket port: from config.json ("port"), else
-# the 17424 default. Used by the wire probe and the hard-error messages.
-_nws_port() {
-  local port="17424" cfg="$HOME/.config/nws/config.json"
-  if [ -f "$cfg" ]; then
-    port="$(sed -n 's/^[[:space:]]*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -1)"
-    port="${port:-17424}"
+# _nws_socket prints the control-socket path, resolved in the same order as
+# the daemon and the CLI: $NWS_SOCKET, else the config.json "socket" key,
+# else $XDG_RUNTIME_DIR/nws/control.sock, else /run/user/<uid>/nws/control.sock.
+# Used only for messages; the probe itself goes through the nws CLI.
+_nws_socket() {
+  local sock="${NWS_SOCKET:-}" cfg="$HOME/.config/nws/config.json"
+  if [ -z "$sock" ] && [ -f "$cfg" ]; then
+    sock="$(sed -n 's/.*"socket"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)"
   fi
-  printf '%s\n' "$port"
+  if [ -z "$sock" ]; then
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      sock="${XDG_RUNTIME_DIR%/}/nws/control.sock"
+    else
+      sock="/run/user/$(id -u)/nws/control.sock"
+    fi
+  fi
+  printf '%s\n' "$sock"
 }
 
-# _nws_daemon_up probes daemon liveness on the wire: connect to the control
-# socket (port from config.json, else the 17424 default) and check that the
-# raw `LIST` reply starts with `OK` (list_reply's `OK <count>`). Guarded to
-# be safe under set -euo pipefail and to leave no leaked fd. bash /dev/tcp
-# needs no nc. Connection refused, a non-OK reply, or a wedged daemon that
-# accepts but never replies (read -t 2 timeout) = no reachable daemon.
+# _nws_daemon_up probes daemon liveness: `nws list` connects to the control
+# socket and exits non-zero when no daemon listens there (or it never
+# replies). bash cannot open Unix sockets, so the CLI is the probe. A wedged
+# daemon that accepts but never answers is cut off by `timeout` when present.
 _nws_daemon_up() {
-  local port="" line=""
-  port="$(_nws_port)"
-  if ! { exec 3<> "/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then return 1; fi
-  printf 'LIST\n' >&3
-  IFS= read -r -t 2 line <&3 || true
-  # NOTE: `exec 3>&-` must NOT carry a `2>/dev/null` — exec with no
-  # command applies redirections PERMANENTLY to the shell itself, so a
-  # `2>/dev/null` here would silently kill every later stderr message
-  # (including the fail-hard ERRORs). Closing fd 3 can only fail when the
-  # fd is already gone, hence the harmless `|| true`.
-  exec 3>&- || true
-  [[ "$line" == OK* ]]
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 "$NWS_BIN" list >/dev/null 2>&1
+  else
+    "$NWS_BIN" list >/dev/null 2>&1
+  fi
 }
 
 ensure_daemon() {
-  # Liveness probe: the raw LIST reply must start with `OK`. The exit code
-  # is NOT a probe — every nws client command returns 0 even when the daemon
-  # is unreachable (it prints an error and returns), which would make us
-  # silently use a dead daemon and never spawn our own. And `nws list`'s
-  # client strips the OK header, so only the wire reply carries it.
+  # Liveness probe: `nws list` succeeds only against a live daemon.
   if _nws_daemon_up; then
     echo "==> nws daemon already running — using it (never killed or restarted)"
     return 0
   fi
   NWS_DAEMON_LOG="/tmp/nws-example-${EXAMPLE_NAME}-daemon.log"
-  # Detach the spawned daemon into its OWN session: `nws service` has no
-  # signal handler, so inside the script's process group a terminal Ctrl+C
-  # would kill it together with the script. setsid only changes the session
+  # Detach the spawned daemon into its OWN session: `nws service` stops on
+  # SIGINT, so inside the script's process group a terminal Ctrl+C would
+  # stop it together with the script. setsid only changes the session
   # (not the pid) — the EXIT trap's `kill $NWS_DAEMON_PID` / `wait` still
   # target it.
   setsid "$NWS_BIN" service >"$NWS_DAEMON_LOG" 2>&1 &
@@ -168,8 +161,9 @@ ensure_daemon() {
       echo "==> daemon ready"
       return 0
     fi
-    # A spawned daemon that exits immediately (port already taken, crash at
-    # startup) can never come up — stop probing a dead pid and fail hard.
+    # A spawned daemon that exits immediately (another daemon on the socket,
+    # crash at startup) can never come up — stop probing a dead pid and fail
+    # hard.
     if ! kill -0 "$NWS_DAEMON_PID" 2>/dev/null; then
       break
     fi
@@ -179,25 +173,24 @@ ensure_daemon() {
   # against a dead daemon would FAKE a successful run — register "succeeds"
   # with exit 0, wait_for_splice burns 90 s on nothing, and a stale
   # flake.nix can even "pass". A dead spawn must be an error, not a warning.
-  echo "ERROR: the spawned nws daemon did not answer LIST with OK." >&2
+  echo "ERROR: the spawned nws daemon did not answer on $(_nws_socket)." >&2
   echo "   log: $NWS_DAEMON_LOG" >&2
-  echo "   (port 127.0.0.1:$(_nws_port) already in use by another process? another daemon? a crash at startup?)" >&2
+  echo "   (another daemon already on that socket? a socket directory nws refuses? a crash at startup?)" >&2
   echo "   Check the log above, then re-run — or start 'nws service' yourself." >&2
   exit 1
 }
 ensure_daemon
 
 # --- registration -------------------------------------------------------------
-# Idempotent, but only against a LIVE daemon: claim _nws_daemon_up FIRST —
-# the `nws list` exit code is not a probe (every client command returns 0
-# even when the daemon is unreachable). Skips an already-registered
-# workspace; a register race reply containing `ERROR already registered`
-# counts as success. A daemon not reachable at registration time, or a
-# register reply carrying `cannot reach daemon`, are HARD errors — a dead
-# daemon must never produce a fake "==> registered". NEVER de-registers.
+# Idempotent, but only against a LIVE daemon: claim _nws_daemon_up FIRST.
+# Skips an already-registered workspace; a register race reply containing
+# `ERROR already registered` counts as success. A daemon not reachable at
+# registration time, or a register reply carrying `no daemon listening`, are
+# HARD errors — a dead daemon must never produce a fake "==> registered".
+# NEVER de-registers.
 register_or_skip() {
   if ! _nws_daemon_up; then
-    echo "ERROR: nws daemon not reachable on 127.0.0.1:$(_nws_port) — run 'nws service' or let ensure_daemon spawn one" >&2
+    echo "ERROR: nws daemon not reachable on $(_nws_socket) — run 'nws service' or let ensure_daemon spawn one" >&2
     exit 1
   fi
   if "$NWS_BIN" list 2>/dev/null | grep -qxF "$WS"; then
@@ -206,13 +199,11 @@ register_or_skip() {
   fi
   local out rc
   out="$("$NWS_BIN" register . "$@" 2>&1)" && rc=0 || rc=$?
-  # A `cannot reach daemon` reply must be checked BEFORE the exit code:
-  # client commands return 0 even when the daemon is unreachable, so rc==0
-  # alone would fake a registration against a vanished daemon. We probed
-  # liveness just above, so this reply means the daemon died mid-register.
-  if grep -qF 'cannot reach daemon' <<<"$out"; then
+  # We probed liveness just above, so a `no daemon listening` reply means the
+  # daemon died mid-register; name that case before the generic failure.
+  if grep -qF 'no daemon listening' <<<"$out"; then
     echo "ERROR: the daemon vanished between the liveness probe and the register —" >&2
-    echo "   'nws register' could not reach it on 127.0.0.1:$(_nws_port)." >&2
+    echo "   'nws register' could not reach it on $(_nws_socket)." >&2
     echo "   Re-run the example; if the daemon keeps dying, check its log." >&2
     exit 1
   fi

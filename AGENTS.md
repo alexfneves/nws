@@ -4,7 +4,7 @@ Instructions for any agent (or human) working in the `nws` repository. Read this
 
 ## What this is
 
-`nws` is a single Odin CLI binary that, in daemon mode (`nws service`), watches a set of Nix **workspace** folders and manages a generated `flake.nix` at each workspace root: cloned child repos are pinned via `path:./<name>` inputs (canonical GitHub URLs kept as `# nws:` markers and persisted in state), uncloned ones fall back to their GitHub URL, and the children's outputs are aggregated namespaced. Child flakes themselves are never modified. It also exposes a tiny localhost TCP control socket that the `register` / `unregister` / `list` client commands talk to.
+`nws` is a single Odin CLI binary that, in daemon mode (`nws service`), watches a set of Nix **workspace** folders and manages a generated `flake.nix` at each workspace root: cloned child repos are pinned via `path:./<name>` inputs (canonical GitHub URLs kept as `# nws:` markers and persisted in state), uncloned ones fall back to their GitHub URL, and the children's outputs are aggregated namespaced. Child flakes themselves are never modified. It also serves a per-user Unix domain control socket (default `$XDG_RUNTIME_DIR/nws/control.sock`) that the `register` / `unregister` / `list` client commands talk to.
 
 See the current implementation plan (when present) under `.pi/plans/YYYY-MM-DD-<name>/plan.md`.
 
@@ -30,7 +30,7 @@ devenv shell       # enter the dev shell
   **Unit tests live in the `tests/` folder** (`tests/*_test.odin`, `package tests`). `src/nix_workspace.odin` is the `package main` binary and is **not** the test target — do not put test procedures there. `odin test tests -collection:nwscore=src` compiles the `tests/` package and runs its `@(test)` procedures. If you change the command in `flake.nix`, keep it pointing at `tests/`.
 
   **Importable core package (validated wiring):** testable logic lives in `src/core/` (`package core`). It is wired via the `nwscore` collection rooted at `src`, so **both** the build and test commands must carry `-collection:nwscore=src`, and code imports it as `import "nwscore:core"` (referencing symbols as `core.xxx`). The standard-library `core:` collection is separate and does not collide (e.g. `import "core:fmt"` is referenced as `fmt.xxx`).
-- **Manual daemon smoke test:** `nix build .#main`, then `result/bin/nws service` in one shell, and `printf 'LIST\n' | nc 127.0.0.1 17424` in another.
+- **Manual daemon smoke test:** `nix build .#main`, then `result/bin/nws service` in one shell, and `printf 'LIST\n' | nc -U "$XDG_RUNTIME_DIR/nws/control.sock"` in another. The scripted version is `tests/smoke_unix_socket.sh`; run it with `HOME` and `XDG_RUNTIME_DIR` pointing under `/tmp/nws-*` (it refuses otherwise) so the live config and socket are never touched.
 
 ## Repo layout
 
@@ -44,8 +44,9 @@ devenv shell       # enter the dev shell
 ## Code conventions
 
 - Odin (2026-07a). Single-threaded event loop on purpose — Odin's allocator is per-thread, so keep all `[dynamic]` config/workspace state on one thread and multiplex with `linux.poll` (inotify fd + control-socket fds). **Do not** introduce threads for the daemon.
-- No `core:net/http` — the control protocol is raw newline-delimited TCP over `127.0.0.1:<port>`. Client paths are percent-encoded so spaces/`%` survive the wire.
-- Sockets must be non-blocking (`net.set_blocking(sock, false)`) before they go into `poll()`; buffer client reads per-fd until a `\n`.
+- No `core:net` / HTTP — the control protocol is raw newline-delimited text over a Unix stream socket, built on `core:sys/linux` (`socket`/`bind`/`accept`/`recv`/`send`). Path resolution lives in `src/core/control_socket.odin`, shared by daemon and CLI. Client paths are percent-encoded so spaces/`%` survive the wire.
+- Control-socket security is load-bearing (REGISTER can name a resolver the daemon executes): keep the 0700 parent dir check, the 0600 socket mode and the `SO_PEERCRED` uid check before any request byte is read. Send with `MSG_NOSIGNAL`.
+- Sockets must be non-blocking (`SOCK_NONBLOCK` on socket/accept) before they go into `poll()`; buffer client reads per-fd until a `\n`.
 - inotify events are variable-length: parse the read buffer in a loop advancing by `size_of(Inotify_Event) + len`.
 - The root flake is user-owned; nws injects/updates ONLY its marked
   `# nws block — managed by nws; do not edit` … `# /nws block` region (the

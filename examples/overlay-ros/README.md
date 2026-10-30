@@ -76,9 +76,8 @@ bash <nws-repo>/examples/overlay-ros/run.sh
 ### Daemon policy and `--hold`
 
 The script never kills or restarts a daemon it did not start. On entry it
-probes the daemon's control socket (a raw `LIST` request; a live daemon
-answers `OK <count>` — client exit codes can't be trusted here, they return
-0 even against a dead daemon): if your own daemon is running it is used
+probes the daemon's control socket with `nws list` (it exits non-zero when
+no daemon listens on the socket): if your own daemon is running it is used
 as-is for the whole run. If none is reachable, a daemon is spawned for this
 run (`nws service`, detached in its own session, log at
 `/tmp/nws-example-overlay-ros-daemon.log`); if the spawned daemon does not

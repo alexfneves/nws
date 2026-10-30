@@ -16,9 +16,7 @@ test_config_roundtrip :: proc(t: ^testing.T) {
 	path := fmt.tprintf("%s/nws-config-test.json", dir)
 	defer os.remove(path)
 
-	cfg := core.Config {
-		port = 17424,
-	}
+	cfg: core.Config
 	cfg.workspaces = make([dynamic]core.Workspace_Config)
 	defer core.delete_workspaces(&cfg)
 	append(
@@ -41,13 +39,6 @@ test_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "load_config should succeed on a valid file")
 	testing.expectf(
 		t,
-		loaded.port == cfg.port,
-		"port mismatch: got %d want %d",
-		loaded.port,
-		cfg.port,
-	)
-	testing.expectf(
-		t,
 		len(loaded.workspaces) == len(cfg.workspaces),
 		"workspace count mismatch: got %d want %d",
 		len(loaded.workspaces),
@@ -65,7 +56,7 @@ test_config_roundtrip :: proc(t: ^testing.T) {
 	}
 }
 
-// Missing file returns defaults (DEFAULT_PORT, no workspaces) and ok=false.
+// Missing file returns defaults (no socket override, no workspaces) and ok=false.
 @(test)
 test_config_missing_file_defaults :: proc(t: ^testing.T) {
 	dir, _ := os.temp_dir(context.allocator)
@@ -74,7 +65,7 @@ test_config_missing_file_defaults :: proc(t: ^testing.T) {
 	cfg, ok := core.load_config(path)
 	defer core.delete_workspaces(&cfg)
 	testing.expectf(t, !ok, "missing file should report ok=false")
-	testing.expectf(t, cfg.port == core.DEFAULT_PORT, "expected DEFAULT_PORT, got %d", cfg.port)
+	testing.expectf(t, cfg.socket == "", "expected no socket override, got %q", cfg.socket)
 	testing.expectf(t, len(cfg.workspaces) == 0, "expected no workspaces")
 }
 
@@ -90,7 +81,7 @@ test_config_corrupt_file_defaults :: proc(t: ^testing.T) {
 	cfg, ok := core.load_config(path)
 	defer core.delete_workspaces(&cfg)
 	testing.expectf(t, !ok, "corrupt file should report ok=false")
-	testing.expectf(t, cfg.port == core.DEFAULT_PORT, "expected DEFAULT_PORT, got %d", cfg.port)
+	testing.expectf(t, cfg.socket == "", "expected no socket override, got %q", cfg.socket)
 }
 
 // URL encode/decode round-trip for spaces, '%', and '/' preservation.
@@ -139,7 +130,7 @@ test_config_legacy_array_byte_stable :: proc(t: ^testing.T) {
 	path := fmt.tprintf("%s/nws-config-legacy.json", dir)
 	defer os.remove(path)
 
-	original := "{\n  \"port\": 17500,\n  \"workspaces\": [\"/a/b\", \"/c d/e%f\"]\n}\n"
+	original := "{\n  \"workspaces\": [\"/a/b\", \"/c d/e%f\"]\n}\n"
 	_ = os.write_entire_file(path, original)
 
 	cfg, ok := core.load_config(path)
@@ -364,16 +355,12 @@ test_workspace_config_clone_roundtrip :: proc(t: ^testing.T) {
 		"clone should compare equal to the original",
 	)
 
-	cfg_a := core.Config {
-		port = core.DEFAULT_PORT,
-	}
+	cfg_a: core.Config
 	cfg_a.workspaces = make([dynamic]core.Workspace_Config)
 	defer core.delete_workspaces(&cfg_a)
 	append(&cfg_a.workspaces, core.clone_workspace_config(orig))
 
-	cfg_b := core.Config {
-		port = core.DEFAULT_PORT,
-	}
+	cfg_b: core.Config
 	cfg_b.workspaces = make([dynamic]core.Workspace_Config)
 	defer core.delete_workspaces(&cfg_b)
 	append(&cfg_b.workspaces, core.clone_workspace_config(clone))
@@ -424,9 +411,7 @@ test_config_roundtrip_dev_shell_packages :: proc(t: ^testing.T) {
 	path := fmt.tprintf("%s/nws-config-devshell.json", dir)
 	defer os.remove(path)
 
-	cfg := core.Config {
-		port = 17424,
-	}
+	cfg: core.Config
 	cfg.workspaces = make([dynamic]core.Workspace_Config)
 	defer core.delete_workspaces(&cfg)
 	ws := core.Workspace_Config {
@@ -560,7 +545,7 @@ test_config_no_trailing_comma :: proc(t: ^testing.T) {
 	)
 
 	loaded, ok := core.load_config(path)
-	defer core.delete_workspaces(&loaded)
+	defer core.delete_config(&loaded)
 	testing.expectf(t, ok, "load_config should succeed")
 	testing.expectf(t, len(loaded.workspaces) == 3, "expected 3 workspaces")
 	if len(loaded.workspaces) == 3 {
@@ -573,4 +558,68 @@ test_config_no_trailing_comma :: proc(t: ^testing.T) {
 			)
 		}
 	}
+}
+
+// A legacy "port" key is accepted (the file still loads), flagged for the
+// one-line warning, and never written back.
+@(test)
+test_config_legacy_port_ignored :: proc(t: ^testing.T) {
+	dir, _ := os.temp_dir(context.allocator)
+	defer delete(dir)
+	path := fmt.tprintf("%s/nws-config-legacy-port.json", dir)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, "{\n  \"port\": 17500,\n  \"workspaces\": [\"/a/b\"]\n}\n")
+
+	cfg, ok := core.load_config(path)
+	defer core.delete_config(&cfg)
+	testing.expectf(t, ok, "a config with \"port\" must still load")
+	testing.expectf(t, cfg.legacy_port, "legacy_port should be set")
+	testing.expectf(t, cfg.socket == "", "port must not turn into a socket override")
+	testing.expectf(t, len(cfg.workspaces) == 1, "workspaces lost")
+
+	text := core.build_config_json(cfg)
+	defer delete(text)
+	testing.expectf(t, !strings.contains(text, "port"), "writer emitted port:\n%s", text)
+	testing.expectf(
+		t,
+		text == "{\n  \"workspaces\": [\"/a/b\"]\n}\n",
+		"unexpected rewrite: %q",
+		text,
+	)
+}
+
+// The optional "socket" key parses and round-trips; it is written first.
+@(test)
+test_config_socket_key :: proc(t: ^testing.T) {
+	dir, _ := os.temp_dir(context.allocator)
+	defer delete(dir)
+	path := fmt.tprintf("%s/nws-config-socket.json", dir)
+	defer os.remove(path)
+	_ = os.write_entire_file(
+		path,
+		`{"socket": "/run/user/1000/custom/nws.sock", "workspaces": ["/a/b"]}`,
+	)
+
+	cfg, ok := core.load_config(path)
+	defer core.delete_config(&cfg)
+	testing.expectf(t, ok, "config with socket should load")
+	testing.expectf(t, !cfg.legacy_port, "no port key ⇒ no warning")
+	testing.expectf(
+		t,
+		cfg.socket == "/run/user/1000/custom/nws.sock",
+		"socket mismatch: %q",
+		cfg.socket,
+	)
+
+	text := core.build_config_json(cfg)
+	defer delete(text)
+	want := "{\n  \"socket\": \"/run/user/1000/custom/nws.sock\",\n  \"workspaces\": [\"/a/b\"]\n}\n"
+	testing.expectf(t, text == want, "rewrite mismatch:\ngot:  %q\nwant: %q", text, want)
+	v, perr := json.parse_string(text, spec = .JSON)
+	json.destroy_value(v)
+	testing.expectf(
+		t,
+		perr == nil && !has_trailing_comma(text),
+		"socket config is not strict JSON",
+	)
 }

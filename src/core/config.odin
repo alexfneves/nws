@@ -273,26 +273,25 @@ build_config_json :: proc(cfg: Config, allocator := context.allocator) -> string
 	return strings.clone(strings.to_string(b), allocator)
 }
 
-// write_workspace_object emits an overlay workspace as a JSON object.
+// write_workspace_object emits an overlay workspace as a JSON object. Every
+// key after "name" starts with its own ",\n" separator, so the last key never
+// carries a trailing comma whichever optional keys are present.
 write_workspace_object :: proc(
 	b: ^strings.Builder,
 	ws: Workspace_Config,
 	allocator: mem.Allocator,
 ) {
 	strings.write_string(b, "{\n")
-	strings.write_string(
-		b,
-		fmt.tprintf("    \"name\": \"%s\",\n", json_escape(ws.name, allocator)),
-	)
-	strings.write_string(b, "    \"backend\": \"overlay\",\n")
+	strings.write_string(b, fmt.tprintf("    \"name\": \"%s\"", json_escape(ws.name, allocator)))
+	strings.write_string(b, ",\n    \"backend\": \"overlay\"")
 	if len(ws.resolver) > 0 {
 		strings.write_string(
 			b,
-			fmt.tprintf("    \"resolver\": \"%s\",\n", json_escape(ws.resolver, allocator)),
+			fmt.tprintf(",\n    \"resolver\": \"%s\"", json_escape(ws.resolver, allocator)),
 		)
 	}
 	if len(ws.overlays) > 0 {
-		strings.write_string(b, "    \"overlays\": [\n")
+		strings.write_string(b, ",\n    \"overlays\": [\n")
 		for ov, i in ws.overlays {
 			strings.write_string(b, "      {\n")
 			strings.write_string(
@@ -323,25 +322,25 @@ write_workspace_object :: proc(
 			}
 			strings.write_string(b, "\n")
 		}
-		strings.write_string(b, "    ],\n")
+		strings.write_string(b, "    ]")
 	}
 	if len(ws.nixpkgs_url) > 0 {
 		strings.write_string(
 			b,
-			fmt.tprintf("    \"nixpkgs\": \"%s\",\n", json_escape(ws.nixpkgs_url, allocator)),
+			fmt.tprintf(",\n    \"nixpkgs\": \"%s\"", json_escape(ws.nixpkgs_url, allocator)),
 		)
 	}
 	if len(ws.dev_shell_packages) > 0 {
-		strings.write_string(b, "    \"devShellPackages\": [")
+		strings.write_string(b, ",\n    \"devShellPackages\": [")
 		for p, i in ws.dev_shell_packages {
 			if i > 0 {
 				strings.write_string(b, ", ")
 			}
 			strings.write_string(b, fmt.tprintf("\"%s\"", json_escape(p, allocator)))
 		}
-		strings.write_string(b, "]\n")
+		strings.write_string(b, "]")
 	}
-	strings.write_string(b, "  }")
+	strings.write_string(b, "\n  }")
 }
 
 // clone_workspace_config deep-copies one Workspace_Config (name, overlay

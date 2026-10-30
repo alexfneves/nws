@@ -1,5 +1,6 @@
 package tests
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -469,4 +470,107 @@ test_config_roundtrip_dev_shell_packages :: proc(t: ^testing.T) {
 	text := core.build_config_json(loaded)
 	defer delete(text)
 	testing.expectf(t, strings.contains(text, "\"devShellPackages\""), "JSON key missing")
+}
+
+// has_trailing_comma reports a ',' followed (after whitespace) by '}' or ']'
+// outside string literals. Needed because core:encoding/json accepts trailing
+// commas even with spec = .JSON.
+has_trailing_comma :: proc(text: string) -> bool {
+	in_str, esc := false, false
+	pending_comma := false
+	for c in transmute([]u8)text {
+		if in_str {
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				in_str = false
+			}
+			continue
+		}
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '}', ']':
+			if pending_comma {
+				return true
+			}
+		case '"':
+			in_str = true
+		}
+		pending_comma = c == ','
+	}
+	return false
+}
+
+// An overlay workspace with overlays but no devShellPackages (and one with
+// nothing after "backend") must serialize without a trailing comma: the
+// output has to parse as strict JSON, not only as the lenient JSON5 default.
+@(test)
+test_config_no_trailing_comma :: proc(t: ^testing.T) {
+	// The checker itself must catch the old bug's shape, or this proves nothing.
+	testing.expect(t, has_trailing_comma("{\n  \"overlays\": [\n  ],\n  }"))
+	testing.expect(t, has_trailing_comma("[1, 2,]"))
+	testing.expect(t, !has_trailing_comma("{\"a\": \",]\", \"b\": [1, 2]}"))
+
+	dir, _ := os.temp_dir(context.allocator)
+	defer delete(dir)
+	path := fmt.tprintf("%s/nws-config-no-trailing-comma.json", dir)
+	defer os.remove(path)
+
+	cfg: core.Config
+	cfg.workspaces = make([dynamic]core.Workspace_Config)
+	defer core.delete_workspaces(&cfg)
+	ws := core.Workspace_Config {
+		name = strings.clone("/ros/ws"),
+		kind = .overlay,
+	}
+	append(
+		&ws.overlays,
+		core.Overlay_Entry {
+			url = strings.clone("github:lopsided98/nix-ros-overlay/master"),
+			attr_path = strings.clone("rosPackages.humble"),
+			is_flake = true,
+		},
+	)
+	append(&cfg.workspaces, ws)
+	append(
+		&cfg.workspaces,
+		core.Workspace_Config{name = strings.clone("/bare/overlay"), kind = .overlay},
+	)
+	append(&cfg.workspaces, core.Workspace_Config{name = strings.clone("/plain/flake")})
+
+	if !core.save_config(path, cfg) {
+		testing.expectf(t, false, "save_config failed for %q", path)
+		return
+	}
+	data, rerr := os.read_entire_file(path, context.allocator)
+	defer delete(data)
+	testing.expectf(t, rerr == nil, "re-read failed")
+
+	v, perr := json.parse(data, spec = .JSON)
+	defer json.destroy_value(v)
+	testing.expectf(t, perr == nil, "output is not valid JSON (%v):\n%s", perr, string(data))
+	testing.expectf(
+		t,
+		!has_trailing_comma(string(data)),
+		"output has a trailing comma:\n%s",
+		string(data),
+	)
+
+	loaded, ok := core.load_config(path)
+	defer core.delete_workspaces(&loaded)
+	testing.expectf(t, ok, "load_config should succeed")
+	testing.expectf(t, len(loaded.workspaces) == 3, "expected 3 workspaces")
+	if len(loaded.workspaces) == 3 {
+		for i in 0 ..< 3 {
+			testing.expectf(
+				t,
+				core.workspace_configs_equal(loaded.workspaces[i], cfg.workspaces[i]),
+				"workspace %d changed in the round trip",
+				i,
+			)
+		}
+	}
 }

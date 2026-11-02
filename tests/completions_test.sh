@@ -14,8 +14,10 @@ cat > "$mock_dir/nws" <<'MOCK'
 #!/usr/bin/env bash
 case "$1" in
   list)
-    if [[ -n "${MOCK_DAEMON_UP:-}" ]]; then
-      printf 'OK 2\n/home/user/a repo\n/home/user/other\n'
+    if [[ -n "${MOCK_EMPTY:-}" ]]; then
+      printf 'OK 0\n'
+    elif [[ -n "${MOCK_DAEMON_UP:-}" ]]; then
+      printf '/home/user/a repo\n/home/user/other\n'
     else
       printf 'nws: no daemon listening on /run/user/1000/nws/control.sock (start one with: nws service)\n' >&2
       exit 1
@@ -44,6 +46,10 @@ COMP_WORDS=(nws register --dev-shell-p); COMP_CWORD=2; COMPREPLY=(); _nws
 export MOCK_DAEMON_UP=1
 COMP_WORDS=(nws unregister ""); COMP_CWORD=2; COMPREPLY=(); _nws
 [[ " ${COMPREPLY[*]} " == *"/home/user/a repo"* ]] && ok "bash unregister name (spaces)" || bad "bash unregister name: ${COMPREPLY[*]}"
+
+# empty registry: real CLI prints "OK 0"; it must not be offered as a path
+MOCK_EMPTY=1 COMP_WORDS=(nws unregister ""); COMP_CWORD=2; COMPREPLY=(); MOCK_EMPTY=1 _nws
+[[ " ${COMPREPLY[*]} " != *"OK"* ]] && ok "bash unregister empty registry offers no OK header" || bad "bash unregister empty: ${COMPREPLY[*]}"
 
 unset MOCK_DAEMON_UP
 COMP_WORDS=(nws unregister ""); COMP_CWORD=2; COMPREPLY=(); _nws

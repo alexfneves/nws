@@ -37,15 +37,14 @@ _nws() {
 }
 
 # Sets $_nws_ws (array of registered workspace canonical paths). Leaves it
-# empty when the daemon is unreachable (stdout won't start with "OK").
+# empty when the daemon is unreachable (`nws list` fails). `nws list` prints
+# only the paths, one per line (no OK header).
 _nws_registered() {
     local out line
     _nws_ws=()
     out=$(nws list 2>/dev/null) || return 1
-    [[ "$out" == OK* ]] || return 1
     while IFS= read -r line; do
-        [[ "$line" == OK* ]] && continue     # skip "OK <count>" header
-        [[ -n "$line" ]] || continue
+        [[ "$line" == /* ]] || continue      # paths only (empty list prints "OK 0")
         _nws_ws+=( "$line" )
     done <<< "$out"
     return 0

@@ -40,15 +40,14 @@ _nws() {
 }
 
 # Fill COMPREPLY with registered workspace canonical paths. Emits nothing and
-# leaves COMPREPLY empty when the daemon is unreachable (stdout won't start OK).
+# leaves COMPREPLY empty when the daemon is unreachable (`nws list` fails).
+# `nws list` prints only the paths, one per line (no OK header).
 _nws_registered() {
     local out line
     out=$(nws list 2>/dev/null) || { COMPREPLY=(); return; }
-    [[ "$out" == OK* ]] || { COMPREPLY=(); return; }
     COMPREPLY=()
     while IFS= read -r line; do
-        [[ "$line" == OK* ]] && continue     # skip the "OK <count>" header
-        [[ -n "$line" ]] || continue
+        [[ "$line" == /* ]] || continue      # paths only (empty list prints "OK 0")
         # include only lines sharing the current prefix (spaces preserved)
         [[ "$line" == "$cur"* ]] && COMPREPLY+=( "$line" )
     done <<< "$out"

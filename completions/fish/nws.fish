@@ -6,14 +6,11 @@
 # fallback when it is not.
 
 function _nws_registered_ws
-    set -l out (nws list 2>/dev/null)
-    if set -q out[1]; and string match -q 'OK*' -- "$out[1]"
-        for line in $out[2..-1]
-            printf '%s\n' "$line"
-        end
-    end
-    # Daemon unreachable: `nws list` prints one non-"OK" line, so this emits
-    # nothing and fish's native file completion applies instead.
+    # `nws list` prints only the paths, one per line. When the daemon is
+    # unreachable it prints nothing on stdout (error goes to stderr), so this
+    # emits nothing and fish's native file completion applies instead.
+    # Empty list prints "OK 0"; keep only absolute paths.
+    nws list 2>/dev/null | string match -r '^/.*'
 end
 
 # Token 1: subcommand names.

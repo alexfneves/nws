@@ -190,6 +190,18 @@ write_overlay_body :: proc(
 
 	// --- outputs section ---
 	strings.write_string(b, "  outputs = { ... }@inputs:\n  let\n")
+	// Child sources are copied into the store through builtins.path with a
+	// filter that drops `.git` at any depth: a fetch or checkout that only
+	// rewrites .git/ must not change the spliced source hash (which would
+	// rebuild the package and its dependants). Every `src` below uses it.
+	// The store name is fixed rather than the child name, because basenames
+	// may hold characters a store name rejects (e.g. `@`), which would fail
+	// evaluation of the whole flake.
+	strings.write_string(b, "    srcOf = p: builtins.path {\n")
+	strings.write_string(b, "      name = \"source\";\n")
+	strings.write_string(b, "      path = p;\n")
+	strings.write_string(b, "      filter = path: _type: baseNameOf path != \".git\";\n")
+	strings.write_string(b, "    };\n")
 	// Base-set resolution per entry: prefer the attrPath on the flake input
 	// itself (nix-ros-overlay-style flakes expose e.g.
 	// legacyPackages.<system>.<distro> directly as outputs), falling back to
@@ -291,7 +303,7 @@ write_overlay_body :: proc(
 			strings.write_string(b, " or null) != null\n")
 			strings.write_string(b, "        then prev.")
 			write_attr_key(b, c.name)
-			strings.write_string(b, ".overrideAttrs (final: { src = ./")
+			strings.write_string(b, ".overrideAttrs (final: { src = srcOf ./")
 			strings.write_string(b, c.rel_path)
 			strings.write_string(b, "; })\n")
 			// Raw source checkouts (no default.nix) are built through the
@@ -303,7 +315,7 @@ write_overlay_body :: proc(
 			nix_escape_string(b, c.name)
 			strings.write_string(b, "\";\n")
 			strings.write_string(b, "          version = \"0.0.0\";\n")
-			strings.write_string(b, "          src = ./")
+			strings.write_string(b, "          src = srcOf ./")
 			strings.write_string(b, c.rel_path)
 			strings.write_string(b, ";\n")
 			strings.write_string(b, "        }\n")

@@ -42,6 +42,11 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
   };
   outputs = { ... }@inputs:
   let
+    srcOf = p: builtins.path {
+      name = "source";
+      path = p;
+      filter = path: _type: baseNameOf path != ".git";
+    };
     baseViaInput0 = inputs.overlay0.rosPackages.humble or null;
     overlaySource0 = import inputs.overlay0;
     overlayResolved0 = if builtins.isFunction overlaySource0 then overlaySource0 { system = "x86_64-linux"; } else overlaySource0;
@@ -54,24 +59,24 @@ test_overlay_flake_golden :: proc(t: ^testing.T) {
         if builtins.pathExists ./.nws/packages/tf2.nix
         then prev.callPackage ./.nws/packages/tf2.nix { }
         else if (prev.tf2 or null) != null
-        then prev.tf2.overrideAttrs (final: { src = ./tf2; })
+        then prev.tf2.overrideAttrs (final: { src = srcOf ./tf2; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2";
           version = "0.0.0";
-          src = ./tf2;
+          src = srcOf ./tf2;
         }
         else prev.callPackage ./tf2 { };
       tf2_msgs = prev:
         if builtins.pathExists ./.nws/packages/tf2_msgs.nix
         then prev.callPackage ./.nws/packages/tf2_msgs.nix { }
         else if (prev.tf2_msgs or null) != null
-        then prev.tf2_msgs.overrideAttrs (final: { src = ./ros/tf2_msgs; })
+        then prev.tf2_msgs.overrideAttrs (final: { src = srcOf ./ros/tf2_msgs; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "tf2_msgs";
           version = "0.0.0";
-          src = ./ros/tf2_msgs;
+          src = srcOf ./ros/tf2_msgs;
         }
         else prev.callPackage ./ros/tf2_msgs { };
     };
@@ -280,7 +285,7 @@ test_overlay_flake_user_override_conditional :: proc(t: ^testing.T) {
         if builtins.pathExists ./.nws/packages/turtlebot3_msgs.nix
         then prev.callPackage ./.nws/packages/turtlebot3_msgs.nix { }
         else if (prev.turtlebot3_msgs or null) != null
-        then prev.turtlebot3_msgs.overrideAttrs (final: { src = ./tb3/turtlebot3_msgs; })
+        then prev.turtlebot3_msgs.overrideAttrs (final: { src = srcOf ./tb3/turtlebot3_msgs; })
         else if (prev.buildRosPackage or null) != null
 `
 	testing.expectf(
@@ -319,7 +324,7 @@ test_overlay_flake_weird_names_unsafe_skip :: proc(t: ^testing.T) {
 	// The safe child is emitted as an unquoted path token.
 	testing.expect(
 		t,
-		strings.contains(got, `src = ./good;`),
+		strings.contains(got, `src = srcOf ./good;`),
 		"safe child emitted without unquoted src token in:\n%s",
 		got,
 	)
@@ -327,6 +332,48 @@ test_overlay_flake_weird_names_unsafe_skip :: proc(t: ^testing.T) {
 		t,
 		strings.contains(got, `builtins.pathExists ./.nws/packages/good.nix`),
 		"safe child pathExists token missing in:\n%s",
+		got,
+	)
+}
+
+// Every child source goes through the srcOf helper, defined once in the let
+// block as a builtins.path copy that filters out `.git` at any depth. A raw
+// `src = ./<child>` would copy .git into the store, so a fetch that only
+// rewrites .git would change the source hash and rebuild the package.
+@(test)
+test_overlay_flake_src_filters_git :: proc(t: ^testing.T) {
+	cfg := ros_cfg()
+	defer core.delete_workspace_config(cfg)
+	children := []core.Overlay_Child {
+		{name = "tf2", rel_path = "tf2"},
+		{name = "tf2_msgs", rel_path = "ros/tf2_msgs"},
+	}
+
+	got := core.generate_overlay_root_flake(children, cfg)
+	defer delete(got)
+
+	helper := `srcOf = p: builtins.path {
+      name = "source";
+      path = p;
+      filter = path: _type: baseNameOf path != ".git";
+    };`
+	testing.expectf(
+		t,
+		strings.count(got, helper) == 1,
+		"srcOf helper must be defined exactly once:\n%s",
+		got,
+	)
+	testing.expectf(
+		t,
+		strings.count(got, "src = srcOf ./") == 2 * len(children),
+		"expected %d srcOf sources (override + bare build per child):\n%s",
+		2 * len(children),
+		got,
+	)
+	testing.expectf(
+		t,
+		strings.count(got, "src = ./") == 0,
+		"no child may be spliced as a raw path source:\n%s",
 		got,
 	)
 }
@@ -357,6 +404,11 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
 # nws block — managed by nws; do not edit
   outputs = { ... }@inputs:
   let
+    srcOf = p: builtins.path {
+      name = "source";
+      path = p;
+      filter = path: _type: baseNameOf path != ".git";
+    };
     baseViaInput0 = null;
     overlaySource0 = import (builtins.fetchTarball "https://example.com/overlay.tar.gz");
     overlayResolved0 = if builtins.isFunction overlaySource0 then overlaySource0 { system = "x86_64-linux"; } else overlaySource0;
@@ -369,12 +421,12 @@ test_overlay_flake_non_flake_entry :: proc(t: ^testing.T) {
         if builtins.pathExists ./.nws/packages/foo.nix
         then prev.callPackage ./.nws/packages/foo.nix { }
         else if (prev.foo or null) != null
-        then prev.foo.overrideAttrs (final: { src = ./foo; })
+        then prev.foo.overrideAttrs (final: { src = srcOf ./foo; })
         else if (prev.buildRosPackage or null) != null
         then prev.buildRosPackage {
           pname = "foo";
           version = "0.0.0";
-          src = ./foo;
+          src = srcOf ./foo;
         }
         else prev.callPackage ./foo { };
     };

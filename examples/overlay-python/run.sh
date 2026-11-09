@@ -32,7 +32,7 @@
 #      the tag keeps it green. Bump it together with the nixpkgs pin — see
 #      the README's Drift caveat.)
 #   4. wait for nws to generate flake.nix — both children spliced in via
-#      `prev.<attr>.overrideAttrs (final: { src = ./<dir>; })`
+#      `prev.<attr>.overrideAttrs (final: { src = srcOf ./<dir>; })`
 #   5. run `nix build` (bare: the generated packages.<system>.default is a
 #      buildEnv of the spliced modules) — best-effort, non-fatal
 #   6. print what to run next, then exit (or --hold to keep the spawned daemon)

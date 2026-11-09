@@ -125,8 +125,7 @@ NIXPKGS_ALLOW_INSECURE=1 nix build --impure       # (run.sh already does this)
   it reads every `package.xml` and emits the package's **overlay attribute
   name** (underscores → hyphens, matching nix-ros-overlay's
   `turtlebot3-msgs` keys) plus its directory.
-- nws src-overrides each NAME: it emits `prev.NAME.overrideAttrs (final: { src =
-  ./RELPATH; })`, so the package's **dependencies are inherited from the overlay**
+- nws src-overrides each NAME: it emits `prev.NAME.overrideAttrs (final: { src = srcOf ./RELPATH; })`, so the package's **dependencies are inherited from the overlay**
   — no dependency re-parsing in nws.
 - Because the local source must match the overlay's pinned deps, the repos are
   cloned from their **ROS1 `noetic` branches**. Cloning `master` would pull ROS2

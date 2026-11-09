@@ -443,14 +443,20 @@ the untouched clone:
 buildRosPackage {
   pname = "turtlebot3_msgs";
   version = "1.0.1";
-  src = ../turtlebot3_msgs;          # points back at the untouched clone
+  src = builtins.path {              # points back at the untouched clone
+    name = "turtlebot3_msgs-src";
+    path = ../turtlebot3_msgs;
+    filter = path: _type: baseNameOf path != ".git";   # never copy .git
+  };
   buildType = "catkin";
   propagatedBuildInputs = [ message_generation message_runtime rospy ];
 }
 ```
 
 Note that `src` is relative to `.nws/packages/`, so it points back out at the
-clone — which nws never modifies. Children without an override file fail open:
+clone — which nws never modifies. Use the same `builtins.path` filter for your
+own `src` (see the `srcOf` note under child discovery): a plain path copies the
+clone's `.git` into the store. Children without an override file fail open:
 they keep the bare `buildRosPackage`/`callPackage` behaviour described above.
 The daemon ignores `.nws` when scanning for child candidates (hidden
 directories are never children), so only real repos are spliced.
@@ -479,9 +485,9 @@ dependencies from the overlay rather than re-parsing them:
   if builtins.pathExists ./.nws/packages/<name>.nix
   then prev.callPackage ./.nws/packages/<name>.nix { }
   else if (prev.<name> or null) != null
-  then prev.<name>.overrideAttrs (final: { src = ./<rel_path>; })
+  then prev.<name>.overrideAttrs (final: { src = srcOf ./<rel_path>; })
   else if (prev.buildRosPackage or null) != null
-  then prev.buildRosPackage { pname="<name>"; version="0.0.0"; src=./<rel_path>; }
+  then prev.buildRosPackage { pname="<name>"; version="0.0.0"; src=srcOf ./<rel_path>; }
   else prev.callPackage ./<rel_path> { };
 ```
 
@@ -489,6 +495,17 @@ So for a plain clone of a package the overlay already defines, the clone
 shadows the upstream source while dependency resolution comes straight from
 the overlay. The `.nws/packages` override hook and the `buildRosPackage` /
 bare `callPackage` fallbacks stay for raw checkouts that cannot be cloned.
+
+Every child `src` goes through `srcOf`, a helper defined once in the generated
+let-block as `builtins.path { name = "source"; path = p; filter = path: _type:
+baseNameOf path != ".git"; }`. A plain `./<child>` path would copy the clone's
+`.git` directory into the store, so a `git fetch` or `git checkout` that only
+rewrites `.git/` (FETCH_HEAD, packed-refs, index) would change the source hash
+and rebuild the package and everything that depends on it, even when the
+working tree is byte-identical. The filter drops `.git` at any depth. The store
+name is fixed rather than the child name, because a directory basename can hold
+characters a store name rejects. `callPackage ./<child> { }` imports a Nix file,
+not a source copy, so it is unchanged.
 
 Every spliced child is also collected into a `default` output
 (`default = { <name> = spliced0.<name>; ... }`), so a bare `nix build` from
@@ -712,6 +729,10 @@ OK 1
 7. Delete a child dir → its attribute disappears and the upstream overlay
    package falls through.
 8. Legacy string-array config loads and saves back byte-stable.
+9. In a spliced clone, run `git fetch` (or `git checkout` of an existing ref)
+   that only rewrites `.git/` → the generated flake is byte-identical and
+   `nix build --dry-run` reports no rebuild of that child (`srcOf` excludes
+   `.git`).
 
 ## Running the tests
 

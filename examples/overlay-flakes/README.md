@@ -78,11 +78,11 @@ inputs = {
         if builtins.pathExists ./.nws/packages/hyprlang.nix
         then prev.callPackage ./.nws/packages/hyprlang.nix { }
         else if (prev.hyprlang or null) != null
-        then prev.hyprlang.overrideAttrs (final: { src = ./hyprlang; })
+        then prev.hyprlang.overrideAttrs (final: { src = srcOf ./hyprlang; })
         ...
 ```
 
-`prev.hyprlang.overrideAttrs (final: { src = ./hyprlang; })` is the splice:
+`prev.hyprlang.overrideAttrs (final: { src = srcOf ./hyprlang; })` is the splice:
 the derivation is the **overlay's** hyprlang (all dependencies — `hyprutils`,
 fetched through the overlay's `hyprlang` input follows — inherited as pinned
 by the overlay flake's lock), only the **source tree** is swapped for
@@ -162,7 +162,7 @@ The derivation rebuilds from the **local clone** (the splice points `src` at
 `./hyprlang`), while `hyprutils` and friends still resolve through the
 overlay's flake inputs — the overlay's pinned dependency graph with your
 source on top. Check the generated `flake.nix` if in doubt: the
-`prev.hyprlang.overrideAttrs (final: { src = ./hyprlang; })` line is the
+`prev.hyprlang.overrideAttrs (final: { src = srcOf ./hyprlang; })` line is the
 splice.
 
 ## Drift caveat

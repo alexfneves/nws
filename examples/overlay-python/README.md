@@ -115,13 +115,13 @@ inputs = {
         if builtins.pathExists ./.nws/packages/requests.nix
         then ...
         else if (prev.requests or null) != null
-        then prev.requests.overrideAttrs (final: { src = ./requests; })
+        then prev.requests.overrideAttrs (final: { src = srcOf ./requests; })
         ...
       typing-extensions = prev: ... prev.typing-extensions.overrideAttrs
-        (final: { src = ./typing_extensions; }) ...
+        (final: { src = srcOf ./typing_extensions; }) ...
 ```
 
-`prev.requests.overrideAttrs (final: { src = ./requests; })` is the splice:
+`prev.requests.overrideAttrs (final: { src = srcOf ./requests; })` is the splice:
 the derivation is the **overlay's** `python312Packages.requests` — all
 dependencies (urllib3, charset_normalizer, …) inherited from
 `python312Packages` exactly as pinned — only the **source tree** is swapped
@@ -248,7 +248,7 @@ The derivation rebuilds from the **local clone** (the splice points `src` at
 `./requests`), while its dependencies still come from `python312Packages` —
 nixpkgs's pinned lattice with your source on top. Check the generated
 `flake.nix` if in doubt: the
-`prev.requests.overrideAttrs (final: { src = ./requests; })` line is the
+`prev.requests.overrideAttrs (final: { src = srcOf ./requests; })` line is the
 splice.
 
 ## Drift caveat
